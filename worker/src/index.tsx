@@ -750,11 +750,12 @@ export default {
                 MAX(cr.started_at) AS last_run,
                 (SELECT COUNT(*) FROM check_runs cr2
                  WHERE cr2.property_id = p.id
+                 AND cr2.run_type = 'inspect'
                  AND cr2.urls_checked = 0 AND cr2.urls_error > 0
                  AND cr2.started_at > datetime('now', '-2 hours')
                 ) AS recent_error_streak
          FROM properties p
-         LEFT JOIN check_runs cr ON p.id = cr.property_id
+         LEFT JOIN check_runs cr ON p.id = cr.property_id AND cr.run_type = 'inspect'
          GROUP BY p.id
          ORDER BY last_run ASC NULLS FIRST`
       )

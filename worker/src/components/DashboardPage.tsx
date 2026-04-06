@@ -163,7 +163,7 @@ const UrlTable: FC<{ urls: UrlRow[]; offset: number; propertyId: string }> = ({ 
                 )}
               </td>
               <td>
-                <Badge status={r.index_status} />
+                <Badge status={r.index_status} coverage={r.coverage_state} />
               </td>
               <td class="dc">
                 {r.content_updated_at ? formatDate(r.content_updated_at) : <span class="never">—</span>}

@@ -35,7 +35,7 @@ export const SubmittedPage: FC<Props> = ({ urls, properties, currentProperty }) 
                   </a>
                 </td>
                 <td>
-                  <Badge status={r.index_status} />
+                  <Badge status={r.index_status} coverage={r.coverage_state} />
                 </td>
                 <td class="dc">{formatDate(r.indexing_submitted_at ?? null)}</td>
                 <td class="dc">{formatDate(r.last_checked_at)}</td>
