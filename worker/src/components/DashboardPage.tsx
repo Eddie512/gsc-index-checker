@@ -67,7 +67,8 @@ const Filters: FC<{
   sort: string;
   dir: string;
   total: number;
-}> = ({ q, status, labelFilter, labels, sort, dir, total }) => {
+  propertyParam: string;
+}> = ({ q, status, labelFilter, labels, sort, dir, total, propertyParam }) => {
   const labelOpts: DropdownOption[] = [
     { value: '', label: 'All Labels' },
     { value: '__unlabeled__', label: 'Unlabeled' },
@@ -76,6 +77,7 @@ const Filters: FC<{
 
   return (
     <form method="get" class="fi">
+      {propertyParam ? <input type="hidden" name="property" value={propertyParam} /> : null}
       <input type="text" name="q" placeholder="Search URLs…" value={q} />
       <Dropdown
         name="status"
@@ -111,6 +113,9 @@ const Filters: FC<{
         selected={dir}
       />
       <button type="submit">Filter</button>
+      {(q || status || labelFilter) ? (
+        <a class="clear" href={propertyParam ? `/?property=${encodeURIComponent(propertyParam)}` : '/'}>Clear</a>
+      ) : null}
       <span class="rc">{total} results</span>
     </form>
   );
@@ -201,9 +206,11 @@ const Pagination: FC<{
   labelFilter: string;
   sort: string;
   dir: string;
-}> = ({ totalPages, page, q, status, labelFilter, sort, dir }) => {
+  propertyParam: string;
+}> = ({ totalPages, page, q, status, labelFilter, sort, dir, propertyParam }) => {
   if (totalPages <= 1) return <></>;
   const params = new URLSearchParams();
+  if (propertyParam) params.set('property', propertyParam);
   if (q) params.set('q', q);
   if (status) params.set('status', status);
   if (labelFilter) params.set('label', labelFilter);
@@ -260,10 +267,10 @@ export const DashboardPage: FC<Props> = (props) => {
       <StatsBar stats={stats} propertyParam={currentProperty?.id || ''} />
       {hasData ? (
         <>
-          <Filters q={q} status={status} labelFilter={labelFilter} labels={labels} sort={sort} dir={dir} total={total} />
+          <Filters q={q} status={status} labelFilter={labelFilter} labels={labels} sort={sort} dir={dir} total={total} propertyParam={currentProperty?.id || ''} />
           <UrlTable urls={urls} offset={offset} propertyId={currentProperty?.id || ''} />
           <BulkLabel total={total} />
-          <Pagination totalPages={totalPages} page={page} q={q} status={status} labelFilter={labelFilter} sort={sort} dir={dir} />
+          <Pagination totalPages={totalPages} page={page} q={q} status={status} labelFilter={labelFilter} sort={sort} dir={dir} propertyParam={currentProperty?.id || ''} />
         </>
       ) : (
         <div class="empty">

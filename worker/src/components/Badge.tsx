@@ -22,17 +22,46 @@ export function shortCoverageLabel(coverage: string | null | undefined): string 
   return null;
 }
 
+/**
+ * Pick a severity class for a short coverage label:
+ *   warn     → yellow  (fixable: Google hasn't indexed yet)
+ *   bad      → red     (broken: server error, 404, blocked)
+ *   excluded → muted   (intentionally not indexed: noindex, duplicate, redirect)
+ */
+function severityClass(label: string): 'warn' | 'bad' | 'excluded' | 'neutral' {
+  switch (label) {
+    case 'UNKNOWN TO GOOGLE':
+    case 'DISCOVERED':
+    case 'CRAWLED':
+      return 'warn';
+    case 'SOFT 404':
+    case 'NOT FOUND':
+    case 'SERVER ERROR':
+    case 'BLOCKED':
+      return 'bad';
+    case 'NOINDEX':
+    case 'DUPLICATE':
+    case 'REDIRECT':
+    case 'EXCLUDED':
+      return 'excluded';
+    default:
+      return 'neutral';
+  }
+}
+
 export const Badge: FC<{ status: string | null; coverage?: string | null }> = ({ status, coverage }) => {
   if (!status) return <span class="never">—</span>;
   const title = coverage || undefined;
   if (status === 'PASS') return <span class="badge pass" title={title}>INDEXED</span>;
   if (status === 'FAIL') {
     const label = shortCoverageLabel(coverage) || 'NOT INDEXED';
-    return <span class="badge fail" title={title}>{label}</span>;
+    const sev = shortCoverageLabel(coverage) ? severityClass(label) : 'bad';
+    return <span class={`badge ${sev}`} title={title}>{label}</span>;
   }
   if (status === 'NEUTRAL') {
     const label = shortCoverageLabel(coverage) || 'NEUTRAL';
-    return <span class="badge neutral" title={title}>{label}</span>;
+    const sev = shortCoverageLabel(coverage) ? severityClass(label) : 'neutral';
+    return <span class={`badge ${sev}`} title={title}>{label}</span>;
   }
   return <span class="badge unknown" title={title}>{status}</span>;
 };

@@ -29,6 +29,8 @@ a.sc{cursor:pointer;transition:background .1s}a.sc:hover{background:var(--surfac
 .fi button{background:#fff;border:none;border-right:1px solid var(--border);border-bottom:1px solid var(--border);color:#000;padding:12px 24px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;font-family:inherit;transition:opacity .1s;white-space:nowrap}
 .fi button:hover{opacity:.8}
 .fi .rc{padding:12px 16px;font-size:11px;color:var(--text-muted);letter-spacing:.04em;white-space:nowrap;border-left:0;display:flex;align-items:center}
+.fi .clear{padding:12px 16px;font-size:11px;color:var(--red);background:var(--red-bg);letter-spacing:.06em;text-transform:uppercase;font-weight:600;white-space:nowrap;border-right:1px solid var(--border);border-bottom:1px solid var(--border);display:flex;align-items:center;text-decoration:none;transition:background .1s}
+.fi .clear:hover{background:rgba(255,51,51,.18)}
 .dd{position:relative;border-right:1px solid var(--border);border-bottom:1px solid var(--border);min-width:130px;user-select:none}
 .dd-trigger{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 16px;font-size:12px;color:var(--text-muted);letter-spacing:.02em;cursor:pointer;background:var(--surface);transition:all .1s;white-space:nowrap}
 .dd-trigger:hover{background:var(--surface-hover);color:var(--text)}
@@ -63,9 +65,10 @@ td{padding:10px 16px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .uc a:hover{text-decoration:underline}
 .badge{display:inline-block;padding:3px 8px;font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
 .badge.pass{background:var(--green-bg);color:var(--green)}
-.badge.fail{background:var(--red-bg);color:var(--red)}
-.badge.unknown{background:var(--yellow-bg);color:var(--yellow)}
+.badge.fail,.badge.bad{background:var(--red-bg);color:var(--red)}
+.badge.unknown,.badge.warn{background:var(--yellow-bg);color:var(--yellow)}
 .badge.neutral{background:rgba(255,255,255,.05);color:var(--text-muted)}
+.badge.excluded{background:rgba(255,255,255,.05);color:#888}
 .dc{color:var(--text-muted);font-size:11px}
 .never{color:#333}
 .lbl{display:inline-block;padding:2px 8px;font-size:10px;font-weight:500;letter-spacing:.04em;text-transform:uppercase;border:1px solid var(--border);color:var(--text-muted);cursor:pointer;transition:all .1s}
