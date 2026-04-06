@@ -1,0 +1,18 @@
+*.log
+*.db
+.DS_Store
+.claude/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build & cache
+.vite/
+.wrangler/
+
+# Worker
+worker/node_modules/
+worker/.wrangler/
+worker/wrangler.toml

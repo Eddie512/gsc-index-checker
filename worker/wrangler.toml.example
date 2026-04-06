@@ -1,0 +1,17 @@
+name = "gsc-index-checker"
+main = "src/index.tsx"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gsc-index-checker"
+database_id = "" # Run `npx wrangler d1 create gsc-index-checker` and paste the ID here
+
+# Cron triggers (Cloudflare max = 3)
+# :00/:30       = sitemap sync (all properties)
+# every 7 min   = inspect one property (round-robin by invocation count)
+[triggers]
+crons = ["0,30 * * * *", "*/7 * * * *"]
+
+[observability.logs]
+enabled = true

@@ -1,0 +1,22 @@
+{
+  "name": "gsc-index-checker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:init": "wrangler d1 execute gsc-index-checker --remote --file=schema.sql"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.0",
+    "@cloudflare/workers-types": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "~3.1.0",
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "hono": "^4.12.10"
+  }
+}
