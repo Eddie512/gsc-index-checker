@@ -26,23 +26,25 @@ The tool runs on Cloudflare Workers with a D1 (SQLite) database. Two cron schedu
 
 | Schedule | Action |
 |----------|--------|
-| Every 30 min (`:00`, `:30`) | Syncs sitemaps, scrapes pages for content dates |
-| Every 7 min | Inspects URLs for one property (round-robin with backoff) |
+| `:00`, `:30` | Sync sitemaps + scrape pages for content dates (every 30 min) |
+| `*/7 * * * *` | Inspect one property via GSC URL Inspection API (every 7 min) |
 
-- **Sitemap sync** parses your sitemaps (supports indexes), adds new pages, and flags removed ones for deletion.
+- **Sitemap sync** parses your sitemaps (supports sitemap indexes), adds new pages, and flags removed ones for deletion.
 - **Content scraping** visits pages in batches of 25, reading meta tags and headers to detect when content was last updated.
-- **URL inspection** checks up to 40 URLs per run against Google's API. The daily quota (~2,000 requests) is shared across properties. Properties with consecutive errors get exponential backoff so one broken site doesn't block others.
-- **Indexing submissions** automatically request reindexing for updated/new pages and deletion for removed ones (up to 200/day across all properties).
+- **URL inspection** checks up to 40 URLs per run against Google's API. Each inspect run picks the least-recently-checked property, with exponential backoff for properties hitting consecutive errors so one broken site doesn't block others. The daily quota (~2,000 requests) is shared across properties.
+- **Indexing submissions** automatically request reindexing for updated/new pages and deletion for removed ones (up to 200/day across all properties, 10 per run).
+- **Analytics cleanup** runs once an hour to prune sessions and events older than 30 days.
 
 ## Dashboard Pages
 
 | Page | Description |
 |------|-------------|
-| **Dashboard** | Stats overview, full URL table with status filters, search, labels, and bulk actions |
-| **Run History** | Logs for every inspection, sync, and scrape run with timing, counts, and errors |
-| **Journeys** | Visitor session analytics with page trails, returning visitors, top pages, and 404 tracking |
-| **Properties** | Add, edit, and manage multiple Search Console properties |
-| **CSV Export** | Download all URL data per property for analysis or reporting |
+| **Dashboard** | Stats overview, full URL table with status filters, search, sort, labels, and bulk actions. Columns include index status, last updated, last crawled, last checked, last submitted, and traffic. |
+| **Journeys** | Visitor session analytics with page trails, returning visitors, top pages, top referrers, and 404 tracking. Powered by an optional tracker script (see setup step 9). |
+| **Submitted** | Timeline of every URL submitted to Google's Indexing API, with type (update vs delete) and quota usage |
+| **Run History** | Logs for every inspection, sync, and scrape run with timing, URL counts, and errors |
+| **Properties** | Add, edit, and manage multiple Search Console properties from a single settings page |
+| **CSV Export** | Download the full URL table for the current property, filters applied |
 
 ## Setup
 
@@ -64,7 +66,7 @@ You need a Google Cloud service account to authenticate with the GSC APIs. This 
 ### 2. Clone and install
 
 ```bash
-git clone https://github.com/YOUR_USER/gsc-index-checker.git
+git clone https://github.com/Eddie512/gsc-index-checker.git
 cd gsc-index-checker/worker
 npm install
 ```
