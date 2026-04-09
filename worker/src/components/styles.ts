@@ -235,12 +235,16 @@ function editLabel(url, el) {
     if (!e.relatedTarget || !e.relatedTarget.closest('.lbl-form')) saveLabel(this.closest('form'), e);
   });
 }
+function currentPropertyQS() {
+  var prop = new URLSearchParams(window.location.search).get('property');
+  return prop ? '?property=' + encodeURIComponent(prop) : '';
+}
 function saveLabel(form, e) {
   e.preventDefault();
   var input = form.querySelector('input');
   var url = decodeURIComponent(input.dataset.url);
   var label = input.value.trim();
-  fetch('/api/label', {
+  fetch('/api/label' + currentPropertyQS(), {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({url: url, label: label || null})
@@ -250,7 +254,7 @@ function bulkLabel(form, e) {
   e.preventDefault();
   var label = form.querySelector('[name=bulk_label]').value.trim();
   var params = new URLSearchParams(window.location.search);
-  fetch('/api/bulk-label', {
+  fetch('/api/bulk-label' + currentPropertyQS(), {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify({
