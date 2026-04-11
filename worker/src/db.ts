@@ -944,6 +944,7 @@ export interface JourneyFilters {
   pathMode?: 'includes' | 'started';
   country?: string;
   device?: string;
+  returning?: 'new' | 'returning';
 }
 
 export async function getJourneys(
@@ -953,7 +954,7 @@ export async function getJourneys(
   perPage: number = 50,
   filters: JourneyFilters = {}
 ): Promise<{ sessions: JourneySession[]; total: number }> {
-  const { pathFilter, pathMode = 'includes', country, device } = filters;
+  const { pathFilter, pathMode = 'includes', country, device, returning } = filters;
   const needsPageviewJoin = pathFilter && pathMode === 'includes';
 
   const baseFrom = needsPageviewJoin
@@ -981,6 +982,11 @@ export async function getJourneys(
   if (device) {
     wheres.push(`${prefix}device = ?`);
     params.push(device);
+  }
+  if (returning === 'new') {
+    wheres.push(`${prefix}is_returning = 0`);
+  } else if (returning === 'returning') {
+    wheres.push(`${prefix}is_returning = 1`);
   }
 
   const whereClause = wheres.join(' AND ');

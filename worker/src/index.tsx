@@ -445,17 +445,21 @@ app.get('/journeys', async (c) => {
   const page = parseInt(url.searchParams.get('page') || '1', 10);
   const view = url.searchParams.get('view') || 'sessions';
   const pathFilter = url.searchParams.get('path') || '';
-  const pathMode = url.searchParams.get('pathMode') === 'started' ? 'started' : 'includes' as const;
+  const pathMode: 'includes' | 'started' = url.searchParams.get('pathMode') === 'started' ? 'started' : 'includes';
   const countryFilter = url.searchParams.get('country') || '';
   const deviceFilter = url.searchParams.get('device') || '';
+  const returningFilter = url.searchParams.get('returning') as 'new' | 'returning' | '' || '';
+
+  const journeyFilters = {
+    pathFilter: pathFilter || undefined,
+    pathMode,
+    country: countryFilter || undefined,
+    device: deviceFilter || undefined,
+    returning: (returningFilter || undefined) as 'new' | 'returning' | undefined,
+  };
 
   const [journeyData, topPages, top404s, recentEvents] = await Promise.all([
-    getJourneys(db, currentProperty.id, page, 50, {
-      pathFilter: pathFilter || undefined,
-      pathMode,
-      country: countryFilter || undefined,
-      device: deviceFilter || undefined,
-    }),
+    getJourneys(db, currentProperty.id, page, 50, journeyFilters),
     getTopPages(db, currentProperty.id),
     getTop404s(db, currentProperty.id),
     getHttpEvents(db, currentProperty.id, 404),
@@ -486,6 +490,7 @@ app.get('/journeys', async (c) => {
       pathMode={pathMode}
       countryFilter={countryFilter}
       deviceFilter={deviceFilter}
+      returningFilter={returningFilter}
       properties={properties}
       currentProperty={currentProperty}
       top404s={top404s}
@@ -494,6 +499,49 @@ app.get('/journeys', async (c) => {
       workerOrigin={url.origin}
     />
   );
+});
+
+// ---- Journeys CSV export ----
+app.get('/journeys/export', async (c) => {
+  const url = new URL(c.req.url);
+  const db = c.env.DB;
+  const { currentProperty } = await resolveProperty(db, url);
+  const pathFilter = url.searchParams.get('path') || '';
+  const pathMode: 'includes' | 'started' = url.searchParams.get('pathMode') === 'started' ? 'started' : 'includes';
+  const countryFilter = url.searchParams.get('country') || '';
+  const deviceFilter = url.searchParams.get('device') || '';
+  const returningFilter = url.searchParams.get('returning') as 'new' | 'returning' | '' || '';
+
+  const data = await getJourneys(db, currentProperty.id, 1, 10000, {
+    pathFilter: pathFilter || undefined,
+    pathMode,
+    country: countryFilter || undefined,
+    device: deviceFilter || undefined,
+    returning: (returningFilter || undefined) as 'new' | 'returning' | undefined,
+  });
+
+  const header = 'Date,Duration,Pages,Device,Region,Type,Journey\n';
+  const rows = data.sessions.map((s) => {
+    const pages = s.pages || [];
+    let durSec = 0;
+    if (pages.length >= 2) {
+      const first = new Date(pages[0].ts).getTime();
+      const last = new Date(pages[pages.length - 1].ts).getTime();
+      durSec = Math.max(0, Math.round((last - first) / 1000));
+    }
+    if (!durSec && s.duration_s) durSec = s.duration_s;
+    const durStr = durSec >= 60 ? `${Math.floor(durSec / 60)}m ${durSec % 60}s` : `${durSec}s`;
+    const geo = [s.city, s.country].filter(Boolean).join(', ');
+    const type = s.is_returning ? 'returning' : 'new';
+    const journey = pages.map((p) => p.page_path).join(' > ');
+    return `"${csvSafe(s.started_at)}","${durStr}",${s.page_count},"${csvSafe(s.device)}","${csvSafe(geo)}","${type}","${csvSafe(journey)}"`;
+  }).join('\n');
+
+  const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  return c.body(header + rows, 200, {
+    'Content-Type': 'text/csv',
+    'Content-Disposition': `attachment;filename=sessions_${currentProperty.id}_${timestamp}.csv`,
+  });
 });
 
 // ---- HTTP Events page ----

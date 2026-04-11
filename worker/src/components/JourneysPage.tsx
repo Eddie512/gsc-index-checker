@@ -52,6 +52,7 @@ interface Props {
   pathMode: 'includes' | 'started';
   countryFilter: string;
   deviceFilter: string;
+  returningFilter: string;
   properties: Property[];
   currentProperty: Property | null;
   top404s: { url: string; count: number }[];
@@ -107,6 +108,7 @@ export const JourneysPage: FC<Props> = ({
   pathMode,
   countryFilter,
   deviceFilter,
+  returningFilter,
   properties,
   currentProperty,
   top404s,
@@ -121,8 +123,9 @@ export const JourneysPage: FC<Props> = ({
   const pm = pathFilter && pathMode === 'started' ? '&pathMode=started' : '';
   const cf = countryFilter ? `&country=${encodeURIComponent(countryFilter)}` : '';
   const df = deviceFilter ? `&device=${encodeURIComponent(deviceFilter)}` : '';
-  const filterQs = `${pp}${pf}${pm}${cf}${df}`;
-  const hasFilters = !!(pathFilter || countryFilter || deviceFilter);
+  const rf = returningFilter ? `&returning=${encodeURIComponent(returningFilter)}` : '';
+  const filterQs = `${pp}${pf}${pm}${cf}${df}${rf}`;
+  const hasFilters = !!(pathFilter || countryFilter || deviceFilter || returningFilter);
   const is404 = view === '404s';
   const total404s = top404s.reduce((sum, e) => sum + e.count, 0);
   const hasAnyData = total > 0 || total404s > 0 || topPages.length > 0;
@@ -153,8 +156,14 @@ export const JourneysPage: FC<Props> = ({
           <option value="mobile" selected={deviceFilter === 'mobile'}>Mobile</option>
           <option value="tablet" selected={deviceFilter === 'tablet'}>Tablet</option>
         </select>
+        <select name="returning" class="path-mode-select">
+          <option value="" selected={!returningFilter}>New & returning</option>
+          <option value="new" selected={returningFilter === 'new'}>New only</option>
+          <option value="returning" selected={returningFilter === 'returning'}>Returning only</option>
+        </select>
         <button type="submit" class="path-filter-btn">Filter</button>
         {hasFilters && <a href={`?view=sessions${pp}`} class="path-filter-clear">Clear</a>}
+        {total > 0 && <a href={`/journeys/export?${filterQs.slice(1)}`} class="path-filter-export">Export CSV</a>}
       </form>
 
       {hasFilters && (
@@ -180,6 +189,12 @@ export const JourneysPage: FC<Props> = ({
               <code class="path-filter-path">{deviceFilter}</code>
             </>
           )}
+          {returningFilter && (
+            <>
+              {(pathFilter || countryFilter || deviceFilter) && <span class="s-sep">·</span>}
+              <code class="path-filter-path">{returningFilter}</code>
+            </>
+          )}
         </div>
       )}
 
@@ -193,7 +208,7 @@ export const JourneysPage: FC<Props> = ({
                     const geo = [s.city, s.country].filter(Boolean).join(', ');
                     const pages = s.pages || [];
                     const pageData = computePageTimes(pages);
-                    const visitorPast = s.is_returning && s.visitor_id ? (pastSessions[s.visitor_id] || []) : [];
+                    const visitorPast = !hasFilters && s.is_returning && s.visitor_id ? (pastSessions[s.visitor_id] || []) : [];
 
                     // Compute total session time from page timestamp diffs (more accurate than duration_s)
                     let totalSec = 0;

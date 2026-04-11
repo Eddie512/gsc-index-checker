@@ -110,6 +110,8 @@ td{padding:10px 16px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .path-filter-path{font-family:'SF Mono','JetBrains Mono',monospace;font-size:11px;color:var(--text);background:rgba(255,255,255,.06);padding:2px 8px;border-radius:3px}
 .path-filter-clear{color:var(--red);text-decoration:none;font-size:11px}
 .path-filter-clear:hover{text-decoration:underline}
+.path-filter-export{color:var(--text-muted);text-decoration:none;font-size:11px;margin-left:auto}
+.path-filter-export:hover{color:var(--text);text-decoration:underline}
 .view-tabs{display:flex;gap:0;margin-bottom:20px;border-bottom:1px solid var(--border)}
 .view-tab{padding:10px 20px;font-size:12px;letter-spacing:.04em;text-transform:uppercase;text-decoration:none;color:var(--text-muted);border-bottom:2px solid transparent;margin-bottom:-1px;transition:all .15s}
 .view-tab:hover{color:var(--text)}
