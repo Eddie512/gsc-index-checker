@@ -939,58 +939,63 @@ export interface JourneySession extends Session {
 }
 
 /** Get multi-page sessions for a property, with their pageviews. */
+export interface JourneyFilters {
+  pathFilter?: string;
+  pathMode?: 'includes' | 'started';
+  country?: string;
+  device?: string;
+}
+
 export async function getJourneys(
   db: D1Database,
   propertyId: string,
   page: number = 1,
   perPage: number = 50,
-  pathFilter?: string,
-  pathMode: 'includes' | 'started' = 'includes'
+  filters: JourneyFilters = {}
 ): Promise<{ sessions: JourneySession[]; total: number }> {
-  let countSql: string;
-  let countParams: string[];
-  let listSql: string;
-  let listParams: (string | number)[];
+  const { pathFilter, pathMode = 'includes', country, device } = filters;
+  const needsPageviewJoin = pathFilter && pathMode === 'includes';
+
+  const baseFrom = needsPageviewJoin
+    ? 'sessions s JOIN pageviews pv ON pv.session_id = s.id'
+    : 'sessions s';
+  const prefix = needsPageviewJoin ? 's.' : 's.';
+
+  const wheres: string[] = [`${prefix}property_id = ?`];
+  const params: (string | number)[] = [propertyId];
 
   if (pathFilter && pathMode === 'started') {
-    // Filter to sessions that started on a specific page
-    countSql = `SELECT COUNT(*) AS c FROM sessions
-      WHERE property_id = ? AND landing_page = ?`;
-    countParams = [propertyId, pathFilter];
-
-    listSql = `SELECT * FROM sessions
-      WHERE property_id = ? AND landing_page = ?
-      ORDER BY started_at DESC
-      LIMIT ? OFFSET ?`;
+    wheres.push(`${prefix}landing_page = ?`);
+    params.push(pathFilter);
   } else if (pathFilter) {
-    // Filter to sessions that visited a specific page path
-    countSql = `SELECT COUNT(DISTINCT s.id) AS c FROM sessions s
-      JOIN pageviews pv ON pv.session_id = s.id
-      WHERE s.property_id = ? AND pv.page_path = ?`;
-    countParams = [propertyId, pathFilter];
-
-    listSql = `SELECT DISTINCT s.* FROM sessions s
-      JOIN pageviews pv ON pv.session_id = s.id
-      WHERE s.property_id = ? AND pv.page_path = ?
-      ORDER BY s.started_at DESC
-      LIMIT ? OFFSET ?`;
+    wheres.push('pv.page_path = ?');
+    params.push(pathFilter);
   } else {
-    countSql = 'SELECT COUNT(*) AS c FROM sessions WHERE property_id = ? AND page_count > 1';
-    countParams = [propertyId];
-
-    listSql = `SELECT * FROM sessions
-      WHERE property_id = ? AND page_count > 1
-      ORDER BY started_at DESC
-      LIMIT ? OFFSET ?`;
+    wheres.push(`${prefix}page_count > 1`);
   }
 
-  const countResult = await db.prepare(countSql).bind(...countParams).first<{ c: number }>();
+  if (country) {
+    wheres.push(`${prefix}country = ?`);
+    params.push(country);
+  }
+  if (device) {
+    wheres.push(`${prefix}device = ?`);
+    params.push(device);
+  }
+
+  const whereClause = wheres.join(' AND ');
+  const distinct = needsPageviewJoin ? 'DISTINCT ' : '';
+
+  const countSql = `SELECT COUNT(${distinct}${prefix}id) AS c FROM ${baseFrom} WHERE ${whereClause}`;
+  const listSql = `SELECT ${distinct}${prefix}* FROM ${baseFrom} WHERE ${whereClause} ORDER BY ${prefix}started_at DESC LIMIT ? OFFSET ?`;
+
+  const countResult = await db.prepare(countSql).bind(...params).first<{ c: number }>();
   const total = countResult?.c ?? 0;
 
   const offset = (page - 1) * perPage;
   const sessionRows = await db
     .prepare(listSql)
-    .bind(...(pathFilter ? [propertyId, pathFilter, perPage, offset] : [propertyId, perPage, offset]))
+    .bind(...params, perPage, offset)
     .all<Session>();
 
   if (sessionRows.results.length === 0) {

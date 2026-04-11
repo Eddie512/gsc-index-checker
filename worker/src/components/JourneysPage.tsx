@@ -50,6 +50,8 @@ interface Props {
   view: string;
   pathFilter: string;
   pathMode: 'includes' | 'started';
+  countryFilter: string;
+  deviceFilter: string;
   properties: Property[];
   currentProperty: Property | null;
   top404s: { url: string; count: number }[];
@@ -103,6 +105,8 @@ export const JourneysPage: FC<Props> = ({
   view,
   pathFilter,
   pathMode,
+  countryFilter,
+  deviceFilter,
   properties,
   currentProperty,
   top404s,
@@ -115,7 +119,10 @@ export const JourneysPage: FC<Props> = ({
   const pp = currentProperty ? `&property=${encodeURIComponent(currentProperty.id)}` : '';
   const pf = pathFilter ? `&path=${encodeURIComponent(pathFilter)}` : '';
   const pm = pathFilter && pathMode === 'started' ? '&pathMode=started' : '';
-  const filterQs = `${pp}${pf}${pm}`;
+  const cf = countryFilter ? `&country=${encodeURIComponent(countryFilter)}` : '';
+  const df = deviceFilter ? `&device=${encodeURIComponent(deviceFilter)}` : '';
+  const filterQs = `${pp}${pf}${pm}${cf}${df}`;
+  const hasFilters = !!(pathFilter || countryFilter || deviceFilter);
   const is404 = view === '404s';
   const total404s = top404s.reduce((sum, e) => sum + e.count, 0);
   const hasAnyData = total > 0 || total404s > 0 || topPages.length > 0;
@@ -139,14 +146,40 @@ export const JourneysPage: FC<Props> = ({
           <option value="started" selected={pathMode === 'started'}>Started on</option>
         </select>
         <input type="text" name="path" value={pathFilter} placeholder="/some/page" class="path-filter-input" />
+        <input type="text" name="country" value={countryFilter} placeholder="Country (e.g. US)" class="path-filter-input" style="flex:0 1 120px" />
+        <select name="device" class="path-mode-select">
+          <option value="" selected={!deviceFilter}>Any device</option>
+          <option value="desktop" selected={deviceFilter === 'desktop'}>Desktop</option>
+          <option value="mobile" selected={deviceFilter === 'mobile'}>Mobile</option>
+          <option value="tablet" selected={deviceFilter === 'tablet'}>Tablet</option>
+        </select>
         <button type="submit" class="path-filter-btn">Filter</button>
-        {pathFilter && <a href={`?view=sessions${pp}`} class="path-filter-clear">Clear</a>}
+        {hasFilters && <a href={`?view=sessions${pp}`} class="path-filter-clear">Clear</a>}
       </form>
 
-      {pathFilter && (
+      {hasFilters && (
         <div class="path-filter-bar">
-          <span>Showing sessions that {pathMode === 'started' ? 'started on' : 'visited'}</span>
-          <code class="path-filter-path">{pathFilter}</code>
+          <span>Filtering by</span>
+          {pathFilter && (
+            <>
+              <span>{pathMode === 'started' ? 'started on' : 'visited'}</span>
+              <code class="path-filter-path">{pathFilter}</code>
+            </>
+          )}
+          {countryFilter && (
+            <>
+              {pathFilter && <span class="s-sep">·</span>}
+              <span>country</span>
+              <code class="path-filter-path">{countryFilter}</code>
+            </>
+          )}
+          {deviceFilter && (
+            <>
+              {(pathFilter || countryFilter) && <span class="s-sep">·</span>}
+              <span>device</span>
+              <code class="path-filter-path">{deviceFilter}</code>
+            </>
+          )}
         </div>
       )}
 

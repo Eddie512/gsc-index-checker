@@ -446,9 +446,16 @@ app.get('/journeys', async (c) => {
   const view = url.searchParams.get('view') || 'sessions';
   const pathFilter = url.searchParams.get('path') || '';
   const pathMode = url.searchParams.get('pathMode') === 'started' ? 'started' : 'includes' as const;
+  const countryFilter = url.searchParams.get('country') || '';
+  const deviceFilter = url.searchParams.get('device') || '';
 
   const [journeyData, topPages, top404s, recentEvents] = await Promise.all([
-    getJourneys(db, currentProperty.id, page, 50, pathFilter || undefined, pathMode),
+    getJourneys(db, currentProperty.id, page, 50, {
+      pathFilter: pathFilter || undefined,
+      pathMode,
+      country: countryFilter || undefined,
+      device: deviceFilter || undefined,
+    }),
     getTopPages(db, currentProperty.id),
     getTop404s(db, currentProperty.id),
     getHttpEvents(db, currentProperty.id, 404),
@@ -477,6 +484,8 @@ app.get('/journeys', async (c) => {
       view={view}
       pathFilter={pathFilter}
       pathMode={pathMode}
+      countryFilter={countryFilter}
+      deviceFilter={deviceFilter}
       properties={properties}
       currentProperty={currentProperty}
       top404s={top404s}
