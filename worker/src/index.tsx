@@ -445,9 +445,10 @@ app.get('/journeys', async (c) => {
   const page = parseInt(url.searchParams.get('page') || '1', 10);
   const view = url.searchParams.get('view') || 'sessions';
   const pathFilter = url.searchParams.get('path') || '';
+  const pathMode = url.searchParams.get('pathMode') === 'started' ? 'started' : 'includes' as const;
 
   const [journeyData, topPages, top404s, recentEvents] = await Promise.all([
-    getJourneys(db, currentProperty.id, page, 50, pathFilter || undefined),
+    getJourneys(db, currentProperty.id, page, 50, pathFilter || undefined, pathMode),
     getTopPages(db, currentProperty.id),
     getTop404s(db, currentProperty.id),
     getHttpEvents(db, currentProperty.id, 404),
@@ -475,6 +476,7 @@ app.get('/journeys', async (c) => {
       page={page}
       view={view}
       pathFilter={pathFilter}
+      pathMode={pathMode}
       properties={properties}
       currentProperty={currentProperty}
       top404s={top404s}
@@ -744,18 +746,26 @@ export default {
     const properties = await getProperties(db);
     if (properties.length === 0) return;
 
+    // Single-pass conditional aggregation instead of a correlated subquery.
+    // The old shape re-scanned check_runs once per property for the error streak
+    // (O(properties × runs)). This version joins once and computes both
+    // MAX(started_at) and the 2-hour error-run count in one sweep, served by
+    // idx_runs_property_started.
     const candidates = await db
       .prepare(
         `SELECT p.id,
                 MAX(cr.started_at) AS last_run,
-                (SELECT COUNT(*) FROM check_runs cr2
-                 WHERE cr2.property_id = p.id
-                 AND cr2.run_type = 'inspect'
-                 AND cr2.urls_checked = 0 AND cr2.urls_error > 0
-                 AND cr2.started_at > datetime('now', '-2 hours')
+                SUM(
+                  CASE
+                    WHEN cr.urls_checked = 0
+                     AND cr.urls_error > 0
+                     AND cr.started_at > datetime('now', '-2 hours')
+                    THEN 1 ELSE 0
+                  END
                 ) AS recent_error_streak
          FROM properties p
-         LEFT JOIN check_runs cr ON p.id = cr.property_id AND cr.run_type = 'inspect'
+         LEFT JOIN check_runs cr
+           ON cr.property_id = p.id AND cr.run_type = 'inspect'
          GROUP BY p.id
          ORDER BY last_run ASC NULLS FIRST`
       )

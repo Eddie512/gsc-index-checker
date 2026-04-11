@@ -49,6 +49,7 @@ interface Props {
   page: number;
   view: string;
   pathFilter: string;
+  pathMode: 'includes' | 'started';
   properties: Property[];
   currentProperty: Property | null;
   top404s: { url: string; count: number }[];
@@ -101,6 +102,7 @@ export const JourneysPage: FC<Props> = ({
   page,
   view,
   pathFilter,
+  pathMode,
   properties,
   currentProperty,
   top404s,
@@ -111,6 +113,9 @@ export const JourneysPage: FC<Props> = ({
   const perPage = 50;
   const totalPages = Math.max(1, Math.ceil(total / perPage));
   const pp = currentProperty ? `&property=${encodeURIComponent(currentProperty.id)}` : '';
+  const pf = pathFilter ? `&path=${encodeURIComponent(pathFilter)}` : '';
+  const pm = pathFilter && pathMode === 'started' ? '&pathMode=started' : '';
+  const filterQs = `${pp}${pf}${pm}`;
   const is404 = view === '404s';
   const total404s = top404s.reduce((sum, e) => sum + e.count, 0);
   const hasAnyData = total > 0 || total404s > 0 || topPages.length > 0;
@@ -126,11 +131,22 @@ export const JourneysPage: FC<Props> = ({
         </a>
       </div>
 
+      <form method="get" action="/journeys" class="path-filter-form">
+        {currentProperty && <input type="hidden" name="property" value={currentProperty.id} />}
+        <input type="hidden" name="view" value="sessions" />
+        <select name="pathMode" class="path-mode-select">
+          <option value="includes" selected={pathMode === 'includes'}>Includes page</option>
+          <option value="started" selected={pathMode === 'started'}>Started on</option>
+        </select>
+        <input type="text" name="path" value={pathFilter} placeholder="/some/page" class="path-filter-input" />
+        <button type="submit" class="path-filter-btn">Filter</button>
+        {pathFilter && <a href={`?view=sessions${pp}`} class="path-filter-clear">Clear</a>}
+      </form>
+
       {pathFilter && (
         <div class="path-filter-bar">
-          <span>Showing sessions that visited</span>
+          <span>Showing sessions that {pathMode === 'started' ? 'started on' : 'visited'}</span>
           <code class="path-filter-path">{pathFilter}</code>
-          <a href={`?view=sessions${pp}`} class="path-filter-clear">Clear</a>
         </div>
       )}
 
@@ -255,15 +271,15 @@ export const JourneysPage: FC<Props> = ({
 
               {totalPages > 1 && (
                 <div class="pg">
-                  {page > 1 && <a href={`?page=${page - 1}${pp}`}>&larr; Prev</a>}
+                  {page > 1 && <a href={`?page=${page - 1}${filterQs}`}>&larr; Prev</a>}
                   {Array.from({ length: Math.min(totalPages, 10) }, (_, i) => i + 1).map((p) =>
                     p === page ? (
                       <span class="cur">{p}</span>
                     ) : (
-                      <a href={`?page=${p}${pp}`}>{p}</a>
+                      <a href={`?page=${p}${filterQs}`}>{p}</a>
                     )
                   )}
-                  {page < totalPages && <a href={`?page=${page + 1}${pp}`}>Next &rarr;</a>}
+                  {page < totalPages && <a href={`?page=${page + 1}${filterQs}`}>Next &rarr;</a>}
                 </div>
               )}
             </>

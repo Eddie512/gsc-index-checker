@@ -944,14 +944,25 @@ export async function getJourneys(
   propertyId: string,
   page: number = 1,
   perPage: number = 50,
-  pathFilter?: string
+  pathFilter?: string,
+  pathMode: 'includes' | 'started' = 'includes'
 ): Promise<{ sessions: JourneySession[]; total: number }> {
   let countSql: string;
   let countParams: string[];
   let listSql: string;
   let listParams: (string | number)[];
 
-  if (pathFilter) {
+  if (pathFilter && pathMode === 'started') {
+    // Filter to sessions that started on a specific page
+    countSql = `SELECT COUNT(*) AS c FROM sessions
+      WHERE property_id = ? AND landing_page = ?`;
+    countParams = [propertyId, pathFilter];
+
+    listSql = `SELECT * FROM sessions
+      WHERE property_id = ? AND landing_page = ?
+      ORDER BY started_at DESC
+      LIMIT ? OFFSET ?`;
+  } else if (pathFilter) {
     // Filter to sessions that visited a specific page path
     countSql = `SELECT COUNT(DISTINCT s.id) AS c FROM sessions s
       JOIN pageviews pv ON pv.session_id = s.id
