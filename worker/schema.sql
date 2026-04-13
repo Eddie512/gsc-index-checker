@@ -47,6 +47,9 @@ CREATE INDEX IF NOT EXISTS idx_urls_index_status ON urls(index_status);
 CREATE INDEX IF NOT EXISTS idx_urls_label ON urls(label);
 CREATE INDEX IF NOT EXISTS idx_urls_property ON urls(property_id);
 CREATE INDEX IF NOT EXISTS idx_runs_property ON check_runs(property_id);
+-- Composite index lets the candidate-property query do per-property MAX(started_at)
+-- and the 2-hour error-streak filter via index seeks instead of scanning every run.
+CREATE INDEX IF NOT EXISTS idx_runs_property_started ON check_runs(property_id, started_at);
 
 -- Analytics: user journey tracking
 CREATE TABLE IF NOT EXISTS sessions (
@@ -101,6 +104,16 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_visitor ON sessions(visitor_id);
 CREATE INDEX IF NOT EXISTS idx_pageviews_session ON pageviews(session_id);
 CREATE INDEX IF NOT EXISTS idx_pageviews_property ON pageviews(property_id);
+-- Supports the 30-day retention DELETE (`WHERE ts < datetime('now','-30 days')`).
+-- Without this, each DELETE was a full table scan (~140k rows per run × 15 runs/day).
+CREATE INDEX IF NOT EXISTS idx_pageviews_ts ON pageviews(ts);
+-- Supports analytics queries that filter pageviews by property_id AND a time range
+-- (e.g. traffic-per-url joins and top-page queries with `ts >= datetime('now','-30 days')`).
+-- Without this, the property index narrowed to a property then scanned every row
+-- in that partition to check `ts`.
+CREATE INDEX IF NOT EXISTS idx_pageviews_property_ts ON pageviews(property_id, ts);
+-- Supports sessions-by-page queries (`JOIN pageviews WHERE property_id = ? AND page_path = ?`).
+CREATE INDEX IF NOT EXISTS idx_pageviews_property_path ON pageviews(property_id, page_path);
 CREATE INDEX IF NOT EXISTS idx_events_property ON http_events(property_id);
 CREATE INDEX IF NOT EXISTS idx_events_status ON http_events(status_code);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON http_events(ts);
