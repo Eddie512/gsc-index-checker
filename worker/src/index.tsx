@@ -51,6 +51,7 @@ import {
   getUrlsForContentScrape,
   markUrlsScraped,
   cleanupOldAnalytics,
+  getPathTraffic,
 } from './db';
 import type { Property } from './db';
 import type { Env } from './lib/types';
@@ -93,6 +94,7 @@ const app = new Hono<{ Bindings: Env }>();
 // ---- CORS for tracker endpoints ----
 app.use('/t', cors({ origin: '*', allowMethods: ['POST'] }));
 app.use('/e', cors({ origin: '*', allowMethods: ['POST'] }));
+app.use('/api/traffic', cors({ origin: '*', allowMethods: ['GET'] }));
 
 // ---- Tracker script ----
 app.get('/tracker.js', (c) => {
@@ -251,6 +253,26 @@ async function resolveProperty(db: D1Database, url: URL): Promise<{ properties: 
   if (!currentProperty) throw new Error('No properties configured');
   return { properties, currentProperty };
 }
+
+// ---- API: Traffic per path (public, CORS-enabled) ----
+app.get('/api/traffic', async (c) => {
+  const propertyId = c.req.query('property');
+  if (!propertyId) return c.json({ error: 'Missing property' }, 400);
+
+  const property = await getProperty(c.env.DB, propertyId);
+  if (!property) return c.json({ error: 'Property not found' }, 404);
+
+  // Analytics retention is 30 days; cap days so the prior-window comparison
+  // doesn't quietly slide into an empty range.
+  const daysRaw = parseInt(c.req.query('days') || '7', 10);
+  const days = Math.min(15, Math.max(1, Number.isFinite(daysRaw) ? daysRaw : 7));
+
+  const limitRaw = parseInt(c.req.query('limit') || '50', 10);
+  const limit = Math.min(200, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 50));
+
+  const traffic = await getPathTraffic(c.env.DB, propertyId, days, limit);
+  return c.json(traffic);
+});
 
 // ---- API: Set label for a single URL ----
 app.post('/api/label', async (c) => {

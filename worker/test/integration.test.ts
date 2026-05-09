@@ -87,6 +87,75 @@ describe('Worker HTTP routes', () => {
   });
 });
 
+describe('Worker /api/traffic', () => {
+  beforeEach(async () => {
+    await initDb(env.DB);
+    await cleanDb(env.DB);
+    await env.DB.prepare('DELETE FROM sessions').run();
+    await env.DB.prepare('DELETE FROM pageviews').run();
+    const ts = new Date().toISOString();
+    await env.DB
+      .prepare(
+        `INSERT INTO sessions (id, property_id, landing_page, started_at, updated_at)
+         VALUES ('s1', 'test-prop', '/', ?, ?)`
+      )
+      .bind(ts, ts)
+      .run();
+    await env.DB
+      .prepare(
+        `INSERT INTO pageviews (session_id, property_id, page_path, ts) VALUES ('s1', 'test-prop', '/about', ?)`
+      )
+      .bind(ts)
+      .run();
+  });
+
+  it('returns traffic data with CORS headers', async () => {
+    const ctx = createExecutionContext();
+    const request = new Request('https://gsc.test/api/traffic?property=test-prop&days=7', {
+      headers: { Origin: 'https://www.test.com' },
+    });
+    const response = await worker.fetch(request, env as any, ctx);
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    const data = (await response.json()) as Array<{
+      path: string; sessions: number; prevSessions: number; daily: number[];
+    }>;
+    expect(Array.isArray(data)).toBe(true);
+    expect(data.length).toBe(1);
+    expect(data[0].path).toBe('/about');
+    expect(data[0].sessions).toBe(1);
+    expect(data[0].daily.length).toBe(7);
+  });
+
+  it('returns 400 when property is missing', async () => {
+    const ctx = createExecutionContext();
+    const request = new Request('https://gsc.test/api/traffic?days=7');
+    const response = await worker.fetch(request, env as any, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(400);
+  });
+
+  it('returns 404 for unknown property', async () => {
+    const ctx = createExecutionContext();
+    const request = new Request('https://gsc.test/api/traffic?property=nope&days=7');
+    const response = await worker.fetch(request, env as any, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(404);
+  });
+
+  it('clamps days to a valid range', async () => {
+    const ctx = createExecutionContext();
+    const request = new Request('https://gsc.test/api/traffic?property=test-prop&days=999');
+    const response = await worker.fetch(request, env as any, ctx);
+    await waitOnExecutionContext(ctx);
+
+    const data = (await response.json()) as Array<{ daily: number[] }>;
+    expect(data[0].daily.length).toBe(15);
+  });
+});
+
 describe('Worker label API', () => {
   beforeEach(async () => {
     await initDb(env.DB);

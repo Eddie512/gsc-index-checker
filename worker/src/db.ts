@@ -1132,6 +1132,84 @@ export async function getTopPages(
   return result.results;
 }
 
+export interface PathTraffic {
+  path: string;
+  sessions: number;
+  prevSessions: number;
+  daily: number[];
+}
+
+/**
+ * Top paths by sessions over the last `days` days, with comparison to the
+ * prior `days` window and a daily session-count breakdown (oldest → newest).
+ *
+ * "Sessions" = distinct session_id from pageviews, so a single visit reading
+ * the same page twice counts once.
+ */
+export async function getPathTraffic(
+  db: D1Database,
+  propertyId: string,
+  days: number,
+  limit: number = 50
+): Promise<PathTraffic[]> {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const currentStart = new Date(now - days * dayMs).toISOString();
+  const prevStart = new Date(now - 2 * days * dayMs).toISOString();
+
+  const top = await db
+    .prepare(
+      `SELECT page_path,
+              COUNT(DISTINCT CASE WHEN ts >= ? THEN session_id END) AS sessions,
+              COUNT(DISTINCT CASE WHEN ts <  ? THEN session_id END) AS prev_sessions
+         FROM pageviews
+        WHERE property_id = ? AND ts >= ?
+        GROUP BY page_path
+       HAVING sessions > 0
+        ORDER BY sessions DESC
+        LIMIT ?`
+    )
+    .bind(currentStart, currentStart, propertyId, prevStart, limit)
+    .all<{ page_path: string; sessions: number; prev_sessions: number }>();
+
+  if (top.results.length === 0) return [];
+
+  const paths = top.results.map((r) => r.page_path);
+  const placeholders = paths.map(() => '?').join(',');
+
+  const dailyRows = await db
+    .prepare(
+      `SELECT page_path, date(ts) AS day, COUNT(DISTINCT session_id) AS sessions
+         FROM pageviews
+        WHERE property_id = ? AND ts >= ? AND page_path IN (${placeholders})
+        GROUP BY page_path, day`
+    )
+    .bind(propertyId, currentStart, ...paths)
+    .all<{ page_path: string; day: string; sessions: number }>();
+
+  const byPath = new Map<string, Map<string, number>>();
+  for (const r of dailyRows.results) {
+    let m = byPath.get(r.page_path);
+    if (!m) byPath.set(r.page_path, (m = new Map()));
+    m.set(r.day, r.sessions);
+  }
+
+  const dayKeys: string[] = [];
+  for (let i = days - 1; i >= 0; i--) {
+    dayKeys.push(new Date(now - i * dayMs).toISOString().slice(0, 10));
+  }
+
+  return top.results.map((r) => {
+    const m = byPath.get(r.page_path);
+    return {
+      path: r.page_path,
+      sessions: r.sessions,
+      prevSessions: r.prev_sessions,
+      daily: dayKeys.map((d) => (m?.get(d) ?? 0)),
+    };
+  });
+}
+
 /** Delete analytics data older than 30 days. */
 export async function cleanupOldAnalytics(db: D1Database): Promise<{ sessions: number; pageviews: number; events: number }> {
   const [s, p, e] = await Promise.all([

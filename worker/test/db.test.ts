@@ -19,6 +19,7 @@ import {
   getUrlsToSubmit,
   recordIndexingSubmission,
   deleteRemovedUrl,
+  getPathTraffic,
 } from '../src/db';
 import { initDb, cleanDb, TEST_PROPERTY_ID } from './helpers';
 
@@ -555,6 +556,98 @@ describe('db — indexing submission backoff', () => {
       .first<{ indexing_submit_count: number; indexing_submitted_at: string | null }>();
     expect(row!.indexing_submit_count).toBe(2);
     expect(row!.indexing_submitted_at).toBeTruthy();
+  });
+});
+
+describe('db — getPathTraffic', () => {
+  beforeEach(async () => {
+    await initDb(env.DB);
+    await cleanDb(env.DB);
+    await env.DB.prepare('DELETE FROM sessions').run();
+    await env.DB.prepare('DELETE FROM pageviews').run();
+  });
+
+  async function insertSession(id: string, propertyId: string, startedAt: string) {
+    await env.DB
+      .prepare(
+        `INSERT INTO sessions (id, property_id, landing_page, started_at, updated_at)
+         VALUES (?, ?, '/', ?, ?)`
+      )
+      .bind(id, propertyId, startedAt, startedAt)
+      .run();
+  }
+
+  async function insertPageview(sessionId: string, propertyId: string, path: string, ts: string) {
+    await env.DB
+      .prepare(
+        `INSERT INTO pageviews (session_id, property_id, page_path, ts) VALUES (?, ?, ?, ?)`
+      )
+      .bind(sessionId, propertyId, path, ts)
+      .run();
+  }
+
+  function isoDaysAgo(days: number): string {
+    return new Date(Date.now() - days * 86400000).toISOString();
+  }
+
+  it('returns top paths with current sessions, prevSessions, and daily breakdown', async () => {
+    // Current window (last 7 days): 3 sessions on /a, 1 on /b
+    await insertSession('s1', P, isoDaysAgo(0));
+    await insertPageview('s1', P, '/a', isoDaysAgo(0));
+    await insertSession('s2', P, isoDaysAgo(2));
+    await insertPageview('s2', P, '/a', isoDaysAgo(2));
+    await insertSession('s3', P, isoDaysAgo(2));
+    await insertPageview('s3', P, '/a', isoDaysAgo(2));
+    await insertSession('s4', P, isoDaysAgo(5));
+    await insertPageview('s4', P, '/b', isoDaysAgo(5));
+
+    // Prior window (8–14 days ago): 1 session on /a
+    await insertSession('s5', P, isoDaysAgo(10));
+    await insertPageview('s5', P, '/a', isoDaysAgo(10));
+
+    // Outside the prev window — should be ignored
+    await insertSession('s6', P, isoDaysAgo(40));
+    await insertPageview('s6', P, '/a', isoDaysAgo(40));
+
+    const result = await getPathTraffic(env.DB, P, 7);
+
+    expect(result.length).toBe(2);
+    expect(result[0].path).toBe('/a');
+    expect(result[0].sessions).toBe(3);
+    expect(result[0].prevSessions).toBe(1);
+    expect(result[0].daily.length).toBe(7);
+    expect(result[0].daily.reduce((a, b) => a + b, 0)).toBe(3);
+
+    expect(result[1].path).toBe('/b');
+    expect(result[1].sessions).toBe(1);
+    expect(result[1].prevSessions).toBe(0);
+    expect(result[1].daily.length).toBe(7);
+  });
+
+  it('counts distinct sessions, not pageviews', async () => {
+    await insertSession('s1', P, isoDaysAgo(1));
+    await insertPageview('s1', P, '/a', isoDaysAgo(1));
+    await insertPageview('s1', P, '/a', isoDaysAgo(1));
+    await insertPageview('s1', P, '/a', isoDaysAgo(1));
+
+    const result = await getPathTraffic(env.DB, P, 7);
+    expect(result[0].sessions).toBe(1);
+  });
+
+  it('scopes by property_id', async () => {
+    await insertSession('s1', P, isoDaysAgo(1));
+    await insertPageview('s1', P, '/a', isoDaysAgo(1));
+    await insertSession('s2', 'other-prop', isoDaysAgo(1));
+    await insertPageview('s2', 'other-prop', '/a', isoDaysAgo(1));
+
+    const result = await getPathTraffic(env.DB, P, 7);
+    expect(result.length).toBe(1);
+    expect(result[0].sessions).toBe(1);
+  });
+
+  it('returns empty array when no data', async () => {
+    const result = await getPathTraffic(env.DB, P, 7);
+    expect(result).toEqual([]);
   });
 });
 
