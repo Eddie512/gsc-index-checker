@@ -259,9 +259,6 @@ app.get('/api/traffic', async (c) => {
   const propertyId = c.req.query('property');
   if (!propertyId) return c.json({ error: 'Missing property' }, 400);
 
-  const property = await getProperty(c.env.DB, propertyId);
-  if (!property) return c.json({ error: 'Property not found' }, 404);
-
   // Analytics retention is 30 days; cap days so the prior-window comparison
   // doesn't quietly slide into an empty range.
   const daysRaw = parseInt(c.req.query('days') || '7', 10);
@@ -270,8 +267,27 @@ app.get('/api/traffic', async (c) => {
   const limitRaw = parseInt(c.req.query('limit') || '50', 10);
   const limit = Math.min(200, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 50));
 
+  // getPathTraffic scans every pageview in the property's window (tens of
+  // thousands of rows) and this endpoint is hit on every render of the public
+  // trending widget. That window barely moves minute-to-minute, so cache the
+  // result at the edge keyed by the normalized params — collapsing many
+  // identical renders into one D1 scan per key per TTL. CORS is applied by
+  // middleware on both hit and miss, so the stored copy doesn't need the header.
+  const cache = caches.default;
+  const cacheKey = new Request(
+    `https://traffic-cache.internal/?property=${encodeURIComponent(propertyId)}&days=${days}&limit=${limit}`
+  );
+  const cached = await cache.match(cacheKey);
+  if (cached) return new Response(cached.body, cached);
+
+  const property = await getProperty(c.env.DB, propertyId);
+  if (!property) return c.json({ error: 'Property not found' }, 404);
+
   const traffic = await getPathTraffic(c.env.DB, propertyId, days, limit);
-  return c.json(traffic);
+  const res = c.json(traffic);
+  res.headers.set('Cache-Control', 'public, max-age=600');
+  c.executionCtx.waitUntil(cache.put(cacheKey, res.clone()));
+  return res;
 });
 
 // ---- API: Set label for a single URL ----

@@ -154,6 +154,34 @@ describe('Worker /api/traffic', () => {
     const data = (await response.json()) as Array<{ daily: number[] }>;
     expect(data[0].daily.length).toBe(15);
   });
+
+  it('serves a cached response for repeat requests (no re-scan)', async () => {
+    // First request populates the edge cache.
+    const ctx1 = createExecutionContext();
+    const first = await worker.fetch(
+      new Request('https://gsc.test/api/traffic?property=test-prop&days=7'),
+      env as any,
+      ctx1
+    );
+    await waitOnExecutionContext(ctx1); // flush the waitUntil cache.put
+    expect(((await first.json()) as unknown[]).length).toBe(1);
+
+    // Wipe the underlying pageviews. A fresh aggregation would now return [].
+    await env.DB.prepare('DELETE FROM pageviews').run();
+
+    // Same params → served from cache, so it still reflects the pre-delete data
+    // instead of re-scanning D1.
+    const ctx2 = createExecutionContext();
+    const second = await worker.fetch(
+      new Request('https://gsc.test/api/traffic?property=test-prop&days=7'),
+      env as any,
+      ctx2
+    );
+    await waitOnExecutionContext(ctx2);
+    const data = (await second.json()) as Array<{ path: string; sessions: number }>;
+    expect(data.length).toBe(1);
+    expect(data[0].path).toBe('/about');
+  });
 });
 
 describe('Worker label API', () => {
