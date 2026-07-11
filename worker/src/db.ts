@@ -969,6 +969,14 @@ export async function getJourneys(
     wheres.push(`${prefix}landing_page = ?`);
     params.push(pathFilter);
   } else if (pathFilter) {
+    // Constrain the join to this property's pageviews so the
+    // (property_id, page_path) index can drive the query straight from
+    // pageviews. Without it the planner scans every session for the property
+    // and probes pageviews per session (the pathological ~165k-rows-read-per-
+    // row-returned path). A pageview's property_id always matches its session's,
+    // so this narrows the query plan, not the result set.
+    wheres.push('pv.property_id = ?');
+    params.push(propertyId);
     wheres.push('pv.page_path = ?');
     params.push(pathFilter);
   } else {
