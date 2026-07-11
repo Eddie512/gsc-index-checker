@@ -1218,17 +1218,22 @@ export async function getPathTraffic(
   });
 }
 
-/** Delete analytics data older than 30 days. */
-export async function cleanupOldAnalytics(db: D1Database): Promise<{ sessions: number; pageviews: number; events: number }> {
-  const [s, p, e] = await Promise.all([
+/** Delete old time-series rows (30-day retention). check_runs is operational
+ * history rather than analytics, but it accumulates on the same cadence and had
+ * no retention — left unbounded it made the candidate-property picker's scan
+ * grow forever. */
+export async function cleanupOldAnalytics(db: D1Database): Promise<{ sessions: number; pageviews: number; events: number; checkRuns: number }> {
+  const [s, p, e, r] = await Promise.all([
     db.prepare("DELETE FROM sessions WHERE started_at < datetime('now', '-30 days')").run(),
     db.prepare("DELETE FROM pageviews WHERE ts < datetime('now', '-30 days')").run(),
     db.prepare("DELETE FROM http_events WHERE ts < datetime('now', '-30 days')").run(),
+    db.prepare("DELETE FROM check_runs WHERE started_at < datetime('now', '-30 days')").run(),
   ]);
   return {
     sessions: s.meta?.changes ?? 0,
     pageviews: p.meta?.changes ?? 0,
     events: e.meta?.changes ?? 0,
+    checkRuns: r.meta?.changes ?? 0,
   };
 }
 

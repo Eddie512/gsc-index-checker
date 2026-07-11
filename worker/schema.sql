@@ -47,9 +47,10 @@ CREATE INDEX IF NOT EXISTS idx_urls_index_status ON urls(index_status);
 CREATE INDEX IF NOT EXISTS idx_urls_label ON urls(label);
 CREATE INDEX IF NOT EXISTS idx_urls_property ON urls(property_id);
 CREATE INDEX IF NOT EXISTS idx_runs_property ON check_runs(property_id);
--- Composite index lets the candidate-property query do per-property MAX(started_at)
--- and the 2-hour error-streak filter via index seeks instead of scanning every run.
-CREATE INDEX IF NOT EXISTS idx_runs_property_started ON check_runs(property_id, started_at);
+-- Serves the candidate-property picker. run_type in the middle lets both the
+-- per-property MAX(started_at) (latest inspect run) and the 2-hour error-streak
+-- count seek by (property_id, run_type) instead of scanning every run.
+CREATE INDEX IF NOT EXISTS idx_runs_property_type_started ON check_runs(property_id, run_type, started_at);
 
 -- Analytics: user journey tracking
 CREATE TABLE IF NOT EXISTS sessions (

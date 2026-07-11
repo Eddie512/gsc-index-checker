@@ -815,6 +815,39 @@ async function handleInspectProperty(env: Env, propertyId: string): Promise<void
 // Worker export
 // ---------------------------------------------------------------------------
 
+/**
+ * Pick which property to inspect next: the least-recently-inspected one whose
+ * error backoff (if any) has elapsed. Pure, so the ordering/backoff logic can be
+ * unit-tested without the cron or network.
+ *
+ * @param lastRunById  property_id → most recent inspect run (ISO); absent = never run
+ * @param streakById   property_id → count of all-error inspect runs in the last 2h
+ */
+export function pickPropertyToInspect(
+  propertyIds: string[],
+  lastRunById: Map<string, string | null>,
+  streakById: Map<string, number>,
+  nowMs: number
+): string | null {
+  const candidates = propertyIds
+    .map((id) => ({ id, lastRun: lastRunById.get(id) ?? null, streak: streakById.get(id) ?? 0 }))
+    // Least-recently-inspected first; never-inspected (null) sorts first.
+    .sort((a, b) => {
+      if (a.lastRun === b.lastRun) return 0;
+      if (a.lastRun === null) return -1;
+      if (b.lastRun === null) return 1;
+      return a.lastRun < b.lastRun ? -1 : 1;
+    });
+
+  for (const c of candidates) {
+    if (c.streak === 0) return c.id;
+    const backoffMin = Math.min(60, 7 * Math.pow(2, c.streak - 1));
+    const lastRunAge = c.lastRun ? (nowMs - new Date(c.lastRun).getTime()) / 60000 : Infinity;
+    if (lastRunAge >= backoffMin) return c.id;
+  }
+  return null;
+}
+
 export default {
   fetch: app.fetch,
 
@@ -841,49 +874,43 @@ export default {
     const properties = await getProperties(db);
     if (properties.length === 0) return;
 
-    // Single-pass conditional aggregation instead of a correlated subquery.
-    // The old shape re-scanned check_runs once per property for the error streak
-    // (O(properties × runs)). This version joins once and computes both
-    // MAX(started_at) and the 2-hour error-run count in one sweep, served by
-    // idx_runs_property_started.
-    const candidates = await db
-      .prepare(
-        `SELECT p.id,
-                MAX(cr.started_at) AS last_run,
-                SUM(
-                  CASE
-                    WHEN cr.urls_checked = 0
-                     AND cr.urls_error > 0
-                     AND cr.started_at > datetime('now', '-2 hours')
-                    THEN 1 ELSE 0
-                  END
-                ) AS recent_error_streak
-         FROM properties p
-         LEFT JOIN check_runs cr
-           ON cr.property_id = p.id AND cr.run_type = 'inspect'
-         GROUP BY p.id
-         ORDER BY last_run ASC NULLS FIRST`
-      )
-      .all<{ id: string; last_run: string | null; recent_error_streak: number }>();
+    // Two indexed lookups instead of one full-history scan. The old shape summed
+    // a 2-hour CASE across every check_runs row (LEFT JOIN over all history),
+    // which grew without bound. Now: (A) the latest inspect run per property, and
+    // (B) the recent all-error inspect runs pruned to the last 2 hours — both
+    // served by idx_runs_property_type_started. Merged by pickPropertyToInspect.
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const [lastRuns, streaks] = await Promise.all([
+      db
+        .prepare(
+          `SELECT property_id, MAX(started_at) AS last_run
+             FROM check_runs
+            WHERE run_type = 'inspect'
+            GROUP BY property_id`
+        )
+        .all<{ property_id: string; last_run: string | null }>(),
+      db
+        .prepare(
+          `SELECT property_id, COUNT(*) AS streak
+             FROM check_runs
+            WHERE run_type = 'inspect'
+              AND urls_checked = 0 AND urls_error > 0
+              AND started_at > ?
+            GROUP BY property_id`
+        )
+        .bind(twoHoursAgo)
+        .all<{ property_id: string; streak: number }>(),
+    ]);
 
-    let propertyId: string | null = null;
+    const lastRunById = new Map(lastRuns.results.map((r) => [r.property_id, r.last_run]));
+    const streakById = new Map(streaks.results.map((r) => [r.property_id, r.streak]));
 
-    for (const c of candidates.results) {
-      if (c.recent_error_streak === 0) {
-        propertyId = c.id;
-        break;
-      }
-
-      const backoffMin = Math.min(60, 7 * Math.pow(2, c.recent_error_streak - 1));
-      const lastRunAge = c.last_run
-        ? (Date.now() - new Date(c.last_run).getTime()) / 60000
-        : Infinity;
-
-      if (lastRunAge >= backoffMin) {
-        propertyId = c.id;
-        break;
-      }
-    }
+    const propertyId = pickPropertyToInspect(
+      properties.map((p) => p.id),
+      lastRunById,
+      streakById,
+      Date.now()
+    );
 
     if (!propertyId) return;
 
