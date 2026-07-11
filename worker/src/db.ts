@@ -969,6 +969,14 @@ export async function getJourneys(
     wheres.push(`${prefix}landing_page = ?`);
     params.push(pathFilter);
   } else if (pathFilter) {
+    // Constrain the join to this property's pageviews so the
+    // (property_id, page_path) index can drive the query straight from
+    // pageviews. Without it the planner scans every session for the property
+    // and probes pageviews per session (the pathological ~165k-rows-read-per-
+    // row-returned path). A pageview's property_id always matches its session's,
+    // so this narrows the query plan, not the result set.
+    wheres.push('pv.property_id = ?');
+    params.push(propertyId);
     wheres.push('pv.page_path = ?');
     params.push(pathFilter);
   } else {
@@ -1210,17 +1218,22 @@ export async function getPathTraffic(
   });
 }
 
-/** Delete analytics data older than 30 days. */
-export async function cleanupOldAnalytics(db: D1Database): Promise<{ sessions: number; pageviews: number; events: number }> {
-  const [s, p, e] = await Promise.all([
+/** Delete old time-series rows (30-day retention). check_runs is operational
+ * history rather than analytics, but it accumulates on the same cadence and had
+ * no retention — left unbounded it made the candidate-property picker's scan
+ * grow forever. */
+export async function cleanupOldAnalytics(db: D1Database): Promise<{ sessions: number; pageviews: number; events: number; checkRuns: number }> {
+  const [s, p, e, r] = await Promise.all([
     db.prepare("DELETE FROM sessions WHERE started_at < datetime('now', '-30 days')").run(),
     db.prepare("DELETE FROM pageviews WHERE ts < datetime('now', '-30 days')").run(),
     db.prepare("DELETE FROM http_events WHERE ts < datetime('now', '-30 days')").run(),
+    db.prepare("DELETE FROM check_runs WHERE started_at < datetime('now', '-30 days')").run(),
   ]);
   return {
     sessions: s.meta?.changes ?? 0,
     pageviews: p.meta?.changes ?? 0,
     events: e.meta?.changes ?? 0,
+    checkRuns: r.meta?.changes ?? 0,
   };
 }
 

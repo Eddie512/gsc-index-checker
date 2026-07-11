@@ -47,9 +47,10 @@ CREATE INDEX IF NOT EXISTS idx_urls_index_status ON urls(index_status);
 CREATE INDEX IF NOT EXISTS idx_urls_label ON urls(label);
 CREATE INDEX IF NOT EXISTS idx_urls_property ON urls(property_id);
 CREATE INDEX IF NOT EXISTS idx_runs_property ON check_runs(property_id);
--- Composite index lets the candidate-property query do per-property MAX(started_at)
--- and the 2-hour error-streak filter via index seeks instead of scanning every run.
-CREATE INDEX IF NOT EXISTS idx_runs_property_started ON check_runs(property_id, started_at);
+-- Serves the candidate-property picker. run_type in the middle lets both the
+-- per-property MAX(started_at) (latest inspect run) and the 2-hour error-streak
+-- count seek by (property_id, run_type) instead of scanning every run.
+CREATE INDEX IF NOT EXISTS idx_runs_property_type_started ON check_runs(property_id, run_type, started_at);
 
 -- Analytics: user journey tracking
 CREATE TABLE IF NOT EXISTS sessions (
@@ -107,13 +108,17 @@ CREATE INDEX IF NOT EXISTS idx_pageviews_property ON pageviews(property_id);
 -- Supports the 30-day retention DELETE (`WHERE ts < datetime('now','-30 days')`).
 -- Without this, each DELETE was a full table scan (~140k rows per run × 15 runs/day).
 CREATE INDEX IF NOT EXISTS idx_pageviews_ts ON pageviews(ts);
--- Supports analytics queries that filter pageviews by property_id AND a time range
--- (e.g. traffic-per-url joins and top-page queries with `ts >= datetime('now','-30 days')`).
--- Without this, the property index narrowed to a property then scanned every row
--- in that partition to check `ts`.
-CREATE INDEX IF NOT EXISTS idx_pageviews_property_ts ON pageviews(property_id, ts);
--- Supports sessions-by-page queries (`JOIN pageviews WHERE property_id = ? AND page_path = ?`).
-CREATE INDEX IF NOT EXISTS idx_pageviews_property_path ON pageviews(property_id, page_path);
+-- One covering index serves every pageviews analytics query. The column order
+-- (property_id, page_path, ts, session_id) is deliberate:
+--   * property_id + page_path equality → sessions-by-path (journeys count/list)
+--     and the daily-breakdown IN-list seek straight to a path's rows;
+--   * ts next → time-range filter/CASE is evaluated in-index (no table lookup),
+--     and becomes a range bound once page_path is pinned (daily breakdown);
+--   * session_id last → COUNT(DISTINCT session_id) is answered from the index.
+-- Every hot query (/api/traffic top + daily, getTopPages, the urls traffic join,
+-- and journeys sessions-by-path) plans as a COVERING INDEX scan. getJourneys
+-- must also constrain pv.property_id so the planner drives from pageviews.
+CREATE INDEX IF NOT EXISTS idx_pageviews_property_path_ts_session ON pageviews(property_id, page_path, ts, session_id);
 CREATE INDEX IF NOT EXISTS idx_events_property ON http_events(property_id);
 CREATE INDEX IF NOT EXISTS idx_events_status ON http_events(status_code);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON http_events(ts);
