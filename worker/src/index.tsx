@@ -52,6 +52,7 @@ import {
   markUrlsScraped,
   cleanupOldAnalytics,
   getPathTraffic,
+  rebuildPageviewRollup,
 } from './db';
 import type { Property } from './db';
 import type { Env } from './lib/types';
@@ -95,6 +96,22 @@ const app = new Hono<{ Bindings: Env }>();
 app.use('/t', cors({ origin: '*', allowMethods: ['POST'] }));
 app.use('/e', cors({ origin: '*', allowMethods: ['POST'] }));
 app.use('/api/traffic', cors({ origin: '*', allowMethods: ['GET'] }));
+
+// ---- Crawler guard for dashboard pages ----
+// The dashboards are server-rendered from expensive D1 aggregations and the
+// journeys page links every tracked path, so a crawler walking the link graph
+// fired thousands of heavy scans a day. Tracker beacons, the public traffic
+// API, and robots.txt stay open; everything else turns crawlers away.
+const BOT_EXEMPT_PATHS = new Set(['/t', '/e', '/tracker.js', '/api/traffic', '/robots.txt']);
+app.use('*', async (c, next) => {
+  if (!BOT_EXEMPT_PATHS.has(c.req.path)) {
+    const ua = (c.req.header('User-Agent') || '').toLowerCase();
+    if (BOT_PATTERN.test(ua)) return c.text('crawling disallowed', 403);
+  }
+  await next();
+});
+
+app.get('/robots.txt', (c) => c.text('User-agent: *\nDisallow: /\n'));
 
 // ---- Tracker script ----
 app.get('/tracker.js', (c) => {
@@ -267,12 +284,12 @@ app.get('/api/traffic', async (c) => {
   const limitRaw = parseInt(c.req.query('limit') || '50', 10);
   const limit = Math.min(200, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 50));
 
-  // getPathTraffic scans every pageview in the property's window (tens of
-  // thousands of rows) and this endpoint is hit on every render of the public
-  // trending widget. That window barely moves minute-to-minute, so cache the
-  // result at the edge keyed by the normalized params — collapsing many
-  // identical renders into one D1 scan per key per TTL. CORS is applied by
-  // middleware on both hit and miss, so the stored copy doesn't need the header.
+  // getPathTraffic is expensive and this endpoint is hit on every render of the
+  // public trending widget, so cache the result at the edge keyed by the
+  // normalized params. Note caches.default is per-datacenter, not global — every
+  // colo warms its own copy — so the TTL is generous (1h; trending over a
+  // multi-day window barely moves in an hour). CORS is applied by middleware on
+  // both hit and miss, so the stored copy doesn't need the header.
   const cache = caches.default;
   const cacheKey = new Request(
     `https://traffic-cache.internal/?property=${encodeURIComponent(propertyId)}&days=${days}&limit=${limit}`
@@ -285,7 +302,7 @@ app.get('/api/traffic', async (c) => {
 
   const traffic = await getPathTraffic(c.env.DB, propertyId, days, limit);
   const res = c.json(traffic);
-  res.headers.set('Cache-Control', 'public, max-age=600');
+  res.headers.set('Cache-Control', 'public, max-age=3600');
   c.executionCtx.waitUntil(cache.put(cacheKey, res.clone()));
   return res;
 });
@@ -858,11 +875,12 @@ export default {
   ): Promise<void> {
     const minute = new Date(event.scheduledTime).getUTCMinutes();
 
-    // :00/:30 = sitemap sync + content scraping
+    // :00/:30 = sitemap sync + pageview rollup refresh + (hourly) retention
     if (minute === 0 || minute === 30) {
       ctx.waitUntil(
         Promise.all([
           handleSync(env),
+          rebuildPageviewRollup(env.DB),
           minute === 0 ? cleanupOldAnalytics(env.DB) : Promise.resolve(),
         ])
       );
@@ -883,10 +901,15 @@ export default {
     const [lastRuns, streaks] = await Promise.all([
       db
         .prepare(
-          `SELECT property_id, MAX(started_at) AS last_run
-             FROM check_runs
-            WHERE run_type = 'inspect'
-            GROUP BY property_id`
+          // Correlated subquery rather than GROUP BY: without ANALYZE stats the
+          // planner answers the GROUP BY by scanning every inspect run, while
+          // this form does one covering-index seek to the latest run per
+          // property (properties is a handful of rows).
+          `SELECT p.id AS property_id,
+                  (SELECT MAX(cr.started_at)
+                     FROM check_runs cr
+                    WHERE cr.property_id = p.id AND cr.run_type = 'inspect') AS last_run
+             FROM properties p`
         )
         .all<{ property_id: string; last_run: string | null }>(),
       db

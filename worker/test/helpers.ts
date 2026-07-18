@@ -82,6 +82,19 @@ CREATE TABLE IF NOT EXISTS pageviews (
   ts          TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS pageview_daily (
+  property_id TEXT NOT NULL,
+  page_path   TEXT NOT NULL,
+  day         TEXT NOT NULL,
+  sessions    INTEGER NOT NULL DEFAULT 0,
+  views       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (property_id, page_path, day)
+);
+
+-- Required (not a perf nicety): rebuildPageviewRollup pins this index via
+-- INDEXED BY, which errors if it doesn't exist.
+CREATE INDEX IF NOT EXISTS idx_pageviews_ts_path_session ON pageviews(ts, property_id, page_path, session_id);
+
 CREATE TABLE IF NOT EXISTS http_events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   property_id TEXT NOT NULL,
