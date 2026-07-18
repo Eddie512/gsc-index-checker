@@ -20,6 +20,7 @@ import {
   recordIndexingSubmission,
   deleteRemovedUrl,
   getPathTraffic,
+  rebuildPageviewRollup,
 } from '../src/db';
 import { initDb, cleanDb, TEST_PROPERTY_ID } from './helpers';
 
@@ -565,6 +566,7 @@ describe('db — getPathTraffic', () => {
     await cleanDb(env.DB);
     await env.DB.prepare('DELETE FROM sessions').run();
     await env.DB.prepare('DELETE FROM pageviews').run();
+    await env.DB.prepare('DELETE FROM pageview_daily').run();
   });
 
   async function insertSession(id: string, propertyId: string, startedAt: string) {
@@ -609,6 +611,7 @@ describe('db — getPathTraffic', () => {
     await insertSession('s6', P, isoDaysAgo(40));
     await insertPageview('s6', P, '/a', isoDaysAgo(40));
 
+    await rebuildPageviewRollup(env.DB, 31);
     const result = await getPathTraffic(env.DB, P, 7);
 
     expect(result.length).toBe(2);
@@ -630,6 +633,7 @@ describe('db — getPathTraffic', () => {
     await insertPageview('s1', P, '/a', isoDaysAgo(1));
     await insertPageview('s1', P, '/a', isoDaysAgo(1));
 
+    await rebuildPageviewRollup(env.DB, 31);
     const result = await getPathTraffic(env.DB, P, 7);
     expect(result[0].sessions).toBe(1);
   });
@@ -640,14 +644,30 @@ describe('db — getPathTraffic', () => {
     await insertSession('s2', 'other-prop', isoDaysAgo(1));
     await insertPageview('s2', 'other-prop', '/a', isoDaysAgo(1));
 
+    await rebuildPageviewRollup(env.DB, 31);
     const result = await getPathTraffic(env.DB, P, 7);
     expect(result.length).toBe(1);
     expect(result[0].sessions).toBe(1);
   });
 
   it('returns empty array when no data', async () => {
+    await rebuildPageviewRollup(env.DB, 31);
     const result = await getPathTraffic(env.DB, P, 7);
     expect(result).toEqual([]);
+  });
+
+  it('rollup rebuild is idempotent (upsert, not accumulate)', async () => {
+    await insertSession('s1', P, isoDaysAgo(1));
+    await insertPageview('s1', P, '/a', isoDaysAgo(1));
+
+    await rebuildPageviewRollup(env.DB, 31);
+    await rebuildPageviewRollup(env.DB, 31);
+
+    const row = await env.DB
+      .prepare('SELECT sessions, views FROM pageview_daily WHERE property_id = ? AND page_path = ?')
+      .bind(P, '/a')
+      .first<{ sessions: number; views: number }>();
+    expect(row).toEqual({ sessions: 1, views: 1 });
   });
 });
 

@@ -5,6 +5,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import worker, { pickPropertyToInspect } from '../src/index';
+import { rebuildPageviewRollup } from '../src/db';
 import { initDb, cleanDb } from './helpers';
 
 async function seedUrls(): Promise<void> {
@@ -107,6 +108,9 @@ describe('Worker /api/traffic', () => {
       )
       .bind(ts)
       .run();
+    // /api/traffic reads the rollup, not raw pageviews
+    await env.DB.prepare('DELETE FROM pageview_daily').run();
+    await rebuildPageviewRollup(env.DB);
   });
 
   it('returns traffic data with CORS headers', async () => {
@@ -166,8 +170,10 @@ describe('Worker /api/traffic', () => {
     await waitOnExecutionContext(ctx1); // flush the waitUntil cache.put
     expect(((await first.json()) as unknown[]).length).toBe(1);
 
-    // Wipe the underlying pageviews. A fresh aggregation would now return [].
+    // Wipe the underlying data (raw and rollup). A fresh read would now
+    // return [].
     await env.DB.prepare('DELETE FROM pageviews').run();
+    await env.DB.prepare('DELETE FROM pageview_daily').run();
 
     // Same params → served from cache, so it still reflects the pre-delete data
     // instead of re-scanning D1.
@@ -283,6 +289,60 @@ describe('Worker label API', () => {
     const html = await response.text();
     expect(html).toContain('1 results');
     expect(html).toContain('/holiday/christmas');
+  });
+});
+
+describe('Worker crawler guard', () => {
+  const BOT_UA = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
+
+  beforeEach(async () => {
+    await initDb(env.DB);
+    await cleanDb(env.DB);
+  });
+
+  it('serves a deny-all robots.txt', async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new Request('https://gsc.test/robots.txt'), env as any, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('Disallow: /');
+  });
+
+  it('blocks crawlers from dashboard pages', async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      new Request('https://gsc.test/journeys', { headers: { 'User-Agent': BOT_UA } }),
+      env as any,
+      ctx
+    );
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(403);
+  });
+
+  it('still serves /api/traffic to any user agent', async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      new Request('https://gsc.test/api/traffic?property=test-prop&days=7', {
+        headers: { 'User-Agent': BOT_UA },
+      }),
+      env as any,
+      ctx
+    );
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(200);
+  });
+
+  it('serves dashboard pages to normal browsers', async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      new Request('https://gsc.test/', {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15' },
+      }),
+      env as any,
+      ctx
+    );
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(200);
   });
 });
 

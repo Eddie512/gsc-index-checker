@@ -51,6 +51,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_property ON check_runs(property_id);
 -- per-property MAX(started_at) (latest inspect run) and the 2-hour error-streak
 -- count seek by (property_id, run_type) instead of scanning every run.
 CREATE INDEX IF NOT EXISTS idx_runs_property_type_started ON check_runs(property_id, run_type, started_at);
+-- Direct range seek for the 2-hour error-streak query. The composite above only
+-- serves it via skip-scan, which the planner skips without ANALYZE stats.
+CREATE INDEX IF NOT EXISTS idx_runs_type_started ON check_runs(run_type, started_at);
 
 -- Analytics: user journey tracking
 CREATE TABLE IF NOT EXISTS sessions (
@@ -87,6 +90,24 @@ CREATE TABLE IF NOT EXISTS pageviews (
   ts          TEXT DEFAULT (datetime('now'))
 );
 
+-- Per-day rollup of pageviews (property × path × UTC day), maintained by the
+-- :00/:30 cron (rebuildPageviewRollup upserts the last two days; pageviews are
+-- insert-only with ts = now, so older days never change). The hot analytics
+-- reads (top pages, /api/traffic, urls traffic join) are served from here so
+-- they touch a few hundred rollup rows instead of re-scanning every pageview.
+CREATE TABLE IF NOT EXISTS pageview_daily (
+  property_id TEXT NOT NULL,
+  page_path   TEXT NOT NULL,
+  day         TEXT NOT NULL,
+  sessions    INTEGER NOT NULL DEFAULT 0,
+  views       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (property_id, page_path, day)
+);
+
+-- Covering index for day-range scans across all paths (/api/traffic top query);
+-- the primary key serves the per-path lookups.
+CREATE INDEX IF NOT EXISTS idx_pageview_daily_property_day ON pageview_daily(property_id, day, page_path, sessions);
+
 CREATE TABLE IF NOT EXISTS http_events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   property_id TEXT NOT NULL,
@@ -103,11 +124,16 @@ CREATE TABLE IF NOT EXISTS http_events (
 CREATE INDEX IF NOT EXISTS idx_sessions_property ON sessions(property_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_visitor ON sessions(visitor_id);
+-- Partial index for the journeys default view (multi-page sessions, newest
+-- first): the list walks it in order and stops at LIMIT, the COUNT touches
+-- only multi-page sessions, instead of both scanning every session.
+CREATE INDEX IF NOT EXISTS idx_sessions_property_started_multi ON sessions(property_id, started_at) WHERE page_count > 1;
 CREATE INDEX IF NOT EXISTS idx_pageviews_session ON pageviews(session_id);
 CREATE INDEX IF NOT EXISTS idx_pageviews_property ON pageviews(property_id);
--- Supports the 30-day retention DELETE (`WHERE ts < datetime('now','-30 days')`).
--- Without this, each DELETE was a full table scan (~140k rows per run × 15 runs/day).
-CREATE INDEX IF NOT EXISTS idx_pageviews_ts ON pageviews(ts);
+-- ts-first covering index: serves the 30-day retention DELETE (ts prefix) and
+-- the rollup rebuild's recent-days scan (which pins it via INDEXED BY — the
+-- stat-less planner would otherwise full-scan the property-first index).
+CREATE INDEX IF NOT EXISTS idx_pageviews_ts_path_session ON pageviews(ts, property_id, page_path, session_id);
 -- One covering index serves every pageviews analytics query. The column order
 -- (property_id, page_path, ts, session_id) is deliberate:
 --   * property_id + page_path equality → sessions-by-path (journeys count/list)

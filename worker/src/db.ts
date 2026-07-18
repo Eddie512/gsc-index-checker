@@ -610,9 +610,9 @@ export async function getUrls(
               COALESCE(pv.cnt, 0) AS traffic
        FROM urls u
        LEFT JOIN (
-         SELECT page_path, COUNT(*) AS cnt
-         FROM pageviews
-         WHERE property_id = ? AND ts >= datetime('now', '-30 days')
+         SELECT page_path, SUM(views) AS cnt
+         FROM pageview_daily
+         WHERE property_id = ?
          GROUP BY page_path
        ) pv ON pv.page_path = REPLACE(u.url, 'https://${domain}', '')
        ${where.replace(/property_id/g, 'u.property_id')}
@@ -1000,7 +1000,11 @@ export async function getJourneys(
   const whereClause = wheres.join(' AND ');
   const distinct = needsPageviewJoin ? 'DISTINCT ' : '';
 
-  const countSql = `SELECT COUNT(${distinct}${prefix}id) AS c FROM ${baseFrom} WHERE ${whereClause}`;
+  // COUNT(*) instead of COUNT(s.id) when not deduping: id is a TEXT PK, so
+  // counting it forces a table lookup per row, while COUNT(*) is answered
+  // straight from the (partial) index.
+  const countExpr = needsPageviewJoin ? 'COUNT(DISTINCT s.id)' : 'COUNT(*)';
+  const countSql = `SELECT ${countExpr} AS c FROM ${baseFrom} WHERE ${whereClause}`;
   const listSql = `SELECT ${distinct}${prefix}* FROM ${baseFrom} WHERE ${whereClause} ORDER BY ${prefix}started_at DESC LIMIT ? OFFSET ?`;
 
   const countResult = await db.prepare(countSql).bind(...params).first<{ c: number }>();
@@ -1119,7 +1123,35 @@ export async function getPastSessionsByVisitors(
 }
 
 
-/** Get top pages by visit count for a property (last 30 days). */
+// ─── Pageview daily rollup ─────────────────────────────────────────────
+// pageview_daily pre-aggregates pageviews per (property, path, UTC day) so the
+// hot analytics reads (top pages, /api/traffic, urls traffic join) touch a few
+// hundred rollup rows instead of re-scanning tens of thousands of pageviews.
+// pageviews are insert-only with ts = now (updates only touch max_scroll), so
+// refreshing the last two UTC days keeps the table exact; older days are static.
+
+/** Upsert rollup rows for the last `days` UTC days (default: today + yesterday).
+ * INDEXED BY: without ANALYZE stats the planner answers the ts range with a
+ * full scan of the big pageviews covering index; the hint pins the ts-first
+ * covering index so each rebuild reads only the recent days. */
+export async function rebuildPageviewRollup(db: D1Database, days: number = 2): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO pageview_daily (property_id, page_path, day, sessions, views)
+       SELECT property_id, page_path, date(ts), COUNT(DISTINCT session_id), COUNT(*)
+         FROM pageviews INDEXED BY idx_pageviews_ts_path_session
+        WHERE ts >= date('now', ?)
+        GROUP BY property_id, page_path, date(ts)
+       ON CONFLICT(property_id, page_path, day)
+       DO UPDATE SET sessions = excluded.sessions, views = excluded.views`
+    )
+    .bind(`-${days - 1} days`)
+    .run();
+}
+
+/** Get top pages by visit count for a property (rollup horizon = 30 days).
+ * Served from pageview_daily; excludes pageviews newer than the last rollup
+ * rebuild (≤30 min), which is irrelevant for a 30-day ranking. */
 export async function getTopPages(
   db: D1Database,
   propertyId: string,
@@ -1127,9 +1159,9 @@ export async function getTopPages(
 ): Promise<{ page_path: string; views: number }[]> {
   const result = await db
     .prepare(
-      `SELECT page_path, COUNT(*) AS views
-       FROM pageviews
-       WHERE property_id = ? AND ts >= datetime('now', '-30 days')
+      `SELECT page_path, SUM(views) AS views
+       FROM pageview_daily
+       WHERE property_id = ?
        GROUP BY page_path
        ORDER BY views DESC
        LIMIT ?`
@@ -1148,11 +1180,14 @@ export interface PathTraffic {
 }
 
 /**
- * Top paths by sessions over the last `days` days, with comparison to the
- * prior `days` window and a daily session-count breakdown (oldest → newest).
+ * Top paths by sessions over the last `days` UTC calendar days (including
+ * today), with comparison to the prior `days`-day window and a daily
+ * session-count breakdown (oldest → newest).
  *
- * "Sessions" = distinct session_id from pageviews, so a single visit reading
- * the same page twice counts once.
+ * Served from pageview_daily. "Sessions" = distinct session_id per day, summed
+ * across the window — a session spanning UTC midnight counts once per day it
+ * touches (sessions are short, so this is a negligible over-count), and
+ * pageviews newer than the last rollup rebuild (≤30 min) aren't included yet.
  */
 export async function getPathTraffic(
   db: D1Database,
@@ -1162,22 +1197,24 @@ export async function getPathTraffic(
 ): Promise<PathTraffic[]> {
   const dayMs = 24 * 60 * 60 * 1000;
   const now = Date.now();
-  const currentStart = new Date(now - days * dayMs).toISOString();
-  const prevStart = new Date(now - 2 * days * dayMs).toISOString();
+
+  const dayKey = (msAgo: number) => new Date(now - msAgo).toISOString().slice(0, 10);
+  const currentStartDay = dayKey((days - 1) * dayMs);
+  const prevStartDay = dayKey((2 * days - 1) * dayMs);
 
   const top = await db
     .prepare(
       `SELECT page_path,
-              COUNT(DISTINCT CASE WHEN ts >= ? THEN session_id END) AS sessions,
-              COUNT(DISTINCT CASE WHEN ts <  ? THEN session_id END) AS prev_sessions
-         FROM pageviews
-        WHERE property_id = ? AND ts >= ?
+              SUM(CASE WHEN day >= ? THEN sessions ELSE 0 END) AS sessions,
+              SUM(CASE WHEN day <  ? THEN sessions ELSE 0 END) AS prev_sessions
+         FROM pageview_daily
+        WHERE property_id = ? AND day >= ?
         GROUP BY page_path
        HAVING sessions > 0
         ORDER BY sessions DESC
         LIMIT ?`
     )
-    .bind(currentStart, currentStart, propertyId, prevStart, limit)
+    .bind(currentStartDay, currentStartDay, propertyId, prevStartDay, limit)
     .all<{ page_path: string; sessions: number; prev_sessions: number }>();
 
   if (top.results.length === 0) return [];
@@ -1187,12 +1224,11 @@ export async function getPathTraffic(
 
   const dailyRows = await db
     .prepare(
-      `SELECT page_path, date(ts) AS day, COUNT(DISTINCT session_id) AS sessions
-         FROM pageviews
-        WHERE property_id = ? AND ts >= ? AND page_path IN (${placeholders})
-        GROUP BY page_path, day`
+      `SELECT page_path, day, sessions
+         FROM pageview_daily
+        WHERE property_id = ? AND day >= ? AND page_path IN (${placeholders})`
     )
-    .bind(propertyId, currentStart, ...paths)
+    .bind(propertyId, currentStartDay, ...paths)
     .all<{ page_path: string; day: string; sessions: number }>();
 
   const byPath = new Map<string, Map<string, number>>();
@@ -1228,6 +1264,7 @@ export async function cleanupOldAnalytics(db: D1Database): Promise<{ sessions: n
     db.prepare("DELETE FROM pageviews WHERE ts < datetime('now', '-30 days')").run(),
     db.prepare("DELETE FROM http_events WHERE ts < datetime('now', '-30 days')").run(),
     db.prepare("DELETE FROM check_runs WHERE started_at < datetime('now', '-30 days')").run(),
+    db.prepare("DELETE FROM pageview_daily WHERE day < date('now', '-30 days')").run(),
   ]);
   return {
     sessions: s.meta?.changes ?? 0,
