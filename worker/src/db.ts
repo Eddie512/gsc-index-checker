@@ -736,6 +736,22 @@ export async function getIndexingSubmittedToday(
   return result?.c || 0;
 }
 
+/** Per-property breakdown of today's (UTC) indexing submissions. */
+export async function getIndexingSubmittedTodayByProperty(
+  db: D1Database
+): Promise<Map<string, number>> {
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const result = await db
+    .prepare(
+      `SELECT property_id, COUNT(*) AS c FROM urls
+       WHERE indexing_submitted_at >= ? AND indexing_submitted_at < ?
+       GROUP BY property_id`
+    )
+    .bind(`${today}T00:00:00Z`, `${today}T23:59:59Z`)
+    .all<{ property_id: string; c: number }>();
+  return new Map(result.results.map((r) => [r.property_id, r.c]));
+}
+
 export interface UrlSubmission {
   url: string;
   type: 'URL_UPDATED' | 'URL_DELETED';
