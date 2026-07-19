@@ -651,16 +651,16 @@ async function handleSync(env: Env): Promise<void> {
     if (prop.sitemap_url) {
       const syncStart = new Date().toISOString();
       try {
-        const sitemapUrls = await getAllUrlsFromSitemap(prop.sitemap_url);
-        if (sitemapUrls.length === 0) {
+        const sitemapEntries = await getAllUrlsFromSitemap(prop.sitemap_url);
+        if (sitemapEntries.length === 0) {
           await recordActivity(db, prop.id, 'sync', syncStart, new Date().toISOString(), { urls_found: 0, error: 'empty sitemap' });
           continue;
         }
-        await upsertUrls(db, prop.id, sitemapUrls);
+        await upsertUrls(db, prop.id, sitemapEntries);
 
-        const reconciled = await reconcileUrls(db, prop.id, sitemapUrls);
+        const reconciled = await reconcileUrls(db, prop.id, sitemapEntries.map((e) => e.url));
         await recordActivity(db, prop.id, 'sync', syncStart, new Date().toISOString(), {
-          urls_found: sitemapUrls.length,
+          urls_found: sitemapEntries.length,
           marked_for_deletion: reconciled.markedForDeletion,
           deleted: reconciled.deleted,
           restored: reconciled.restored,

@@ -1,5 +1,6 @@
 /**
- * Tests for sitemap.ts — XML tag extraction, sitemap index and direct sitemap support.
+ * Tests for sitemap.ts — XML tag extraction, sitemap index and direct sitemap
+ * support, and <lastmod> parsing.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -13,8 +14,14 @@ describe('sitemap — getAllUrlsFromSitemap', () => {
 
   const sitemap0 = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>https://www.test.com/</loc></url>
-  <url><loc>https://www.test.com/about</loc></url>
+  <url>
+    <loc>https://www.test.com/</loc>
+    <lastmod>2026-07-05T00:00:00.000Z</lastmod>
+  </url>
+  <url>
+    <loc>https://www.test.com/about</loc>
+    <lastmod>2026-07-01</lastmod>
+  </url>
 </urlset>`;
 
   const sitemap1 = `<?xml version="1.0" encoding="UTF-8"?>
@@ -43,21 +50,39 @@ describe('sitemap — getAllUrlsFromSitemap', () => {
 
   it('parses all URLs from a sitemap index with sub-sitemaps', async () => {
     const { getAllUrlsFromSitemap } = await import('../src/sitemap');
-    const urls = await getAllUrlsFromSitemap('https://www.test.com/sitemap-index.xml');
+    const entries = await getAllUrlsFromSitemap('https://www.test.com/sitemap-index.xml');
 
-    expect(urls).toHaveLength(3);
+    const urls = entries.map((e) => e.url);
+    expect(entries).toHaveLength(3);
     expect(urls).toContain('https://www.test.com/');
     expect(urls).toContain('https://www.test.com/about');
     expect(urls).toContain('https://www.test.com/holiday/christmas');
   });
 
+  it('parses lastmod, normalizing date-only values to ISO', async () => {
+    const { getAllUrlsFromSitemap } = await import('../src/sitemap');
+    const entries = await getAllUrlsFromSitemap('https://www.test.com/sitemap-0.xml');
+
+    const byUrl = new Map(entries.map((e) => [e.url, e.lastmod]));
+    expect(byUrl.get('https://www.test.com/')).toBe('2026-07-05T00:00:00.000Z');
+    expect(byUrl.get('https://www.test.com/about')).toBe('2026-07-01T00:00:00.000Z');
+  });
+
+  it('returns null lastmod when the tag is absent', async () => {
+    const { getAllUrlsFromSitemap } = await import('../src/sitemap');
+    const entries = await getAllUrlsFromSitemap('https://www.test.com/sitemap-1.xml');
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0].url).toBe('https://www.test.com/holiday/christmas');
+    expect(entries[0].lastmod).toBeNull();
+  });
+
   it('parses URLs from a direct sitemap (no index)', async () => {
     const { getAllUrlsFromSitemap } = await import('../src/sitemap');
-    const urls = await getAllUrlsFromSitemap('https://www.test.com/sitemap-0.xml');
+    const entries = await getAllUrlsFromSitemap('https://www.test.com/sitemap-0.xml');
 
-    expect(urls).toHaveLength(2);
-    expect(urls).toContain('https://www.test.com/');
-    expect(urls).toContain('https://www.test.com/about');
+    expect(entries).toHaveLength(2);
+    expect(entries.map((e) => e.url)).toContain('https://www.test.com/');
   });
 
   it('calls fetch for the sitemap index and each sub-sitemap', async () => {
@@ -80,11 +105,11 @@ describe('sitemap — getAllUrlsFromSitemap', () => {
     }));
 
     const { getAllUrlsFromSitemap } = await import('../src/sitemap');
-    const urls = await getAllUrlsFromSitemap('https://www.test.com/sitemap-index.xml');
+    const entries = await getAllUrlsFromSitemap('https://www.test.com/sitemap-index.xml');
 
     // Should still get URLs from sitemap-0
-    expect(urls).toHaveLength(2);
-    expect(urls).toContain('https://www.test.com/');
+    expect(entries).toHaveLength(2);
+    expect(entries.map((e) => e.url)).toContain('https://www.test.com/');
   });
 
   it('throws when sitemap fails', async () => {
