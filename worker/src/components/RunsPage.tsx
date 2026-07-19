@@ -14,12 +14,14 @@ const TYPE_LABELS: Record<RunType, string> = {
   inspect: 'Inspection',
   sync: 'Sitemap Sync',
   scrape: 'Content Scrape',
+  submit: 'Indexing Submit',
 };
 
 const TYPE_COLORS: Record<RunType, string> = {
   inspect: 'var(--green)',
   sync: '#6ea8fe',
   scrape: '#c4a5de',
+  submit: '#e8b45f',
 };
 
 const RunTypeBadge: FC<{ type: RunType }> = ({ type }) => (
@@ -65,6 +67,21 @@ const DetailsSummary: FC<{ run: RunRow }> = ({ run }) => {
     if (d.deleted) parts.push(`${d.deleted} removed`);
     if (d.restored) parts.push(`${d.restored} restored`);
     return <span>{parts.join(' · ') || 'no changes'}</span>;
+  }
+
+  if (type === 'submit') {
+    const parts: string[] = [];
+    if (d.succeeded) parts.push(`${d.succeeded} submitted`);
+    if (d.failed) parts.push(`${d.failed} failed`);
+    if (d.quota_exhausted) parts.push('quota exhausted');
+    return (
+      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+        <span>{parts.join(' · ') || 'nothing to submit'}</span>
+        {d.failures && (
+          <span style="color:var(--red);font-size:11px;flex-basis:100%">{String(d.failures).slice(0, 200)}</span>
+        )}
+      </div>
+    );
   }
 
   if (type === 'scrape') {

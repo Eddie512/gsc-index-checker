@@ -150,6 +150,15 @@ CREATE INDEX IF NOT EXISTS idx_events_property ON http_events(property_id);
 CREATE INDEX IF NOT EXISTS idx_events_status ON http_events(status_code);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON http_events(ts);
 
+-- Indexing API attempt accounting, one row per Google quota day (midnight
+-- Pacific). Attempts — not successes — because Google's quota counts every
+-- publish request; a 429 clamps the day to the full quota (see
+-- markIndexingQuotaExhausted).
+CREATE TABLE IF NOT EXISTS indexing_quota (
+  day      TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL DEFAULT 0
+);
+
 -- Audit trail: permanently keep records of deleted URLs
 CREATE TABLE IF NOT EXISTS deleted_urls (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,

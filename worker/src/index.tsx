@@ -36,8 +36,10 @@ import {
   bulkUpdateLabel,
   syncContentUpdatedDates,
   syncNoindexMismatches,
-  getIndexingSubmittedToday,
   getIndexingSubmittedTodayByProperty,
+  getIndexingAttemptsToday,
+  recordIndexingAttempt,
+  markIndexingQuotaExhausted,
   getUrlsToSubmit,
   recordIndexingSubmission,
   deleteRemovedUrl,
@@ -411,15 +413,17 @@ app.get('/sync', async (c) => {
 app.get('/submit', async (c) => {
   const url = new URL(c.req.url);
   const { currentProperty } = await resolveProperty(c.env.DB, url);
-  const submittedToday = await getIndexingSubmittedToday(c.env.DB);
-  const remaining = Math.max(0, INDEXING_DAILY_QUOTA - submittedToday);
+  // Same ledger as the cron allocator: attempts in Google's quota day.
+  const attemptsUsed = await getIndexingAttemptsToday(c.env.DB);
+  const remaining = Math.max(0, INDEXING_DAILY_QUOTA - attemptsUsed);
   if (remaining <= 0) {
-    return c.json({ message: 'Daily quota reached', submittedToday });
+    return c.json({ message: 'Daily quota reached', attemptsUsed });
   }
   const batchLimit = Math.min(remaining, 5);
   const urlsToSubmit = await getUrlsToSubmit(c.env.DB, currentProperty.id, batchLimit);
   const results: { url: string; type: string; success: boolean; error?: string }[] = [];
   for (const submission of urlsToSubmit) {
+    await recordIndexingAttempt(c.env.DB);
     const result = await submitUrl(submission.url, submission.type, c.env.GSC_CLIENT_EMAIL, c.env.GSC_PRIVATE_KEY);
     if (result.success) {
       if (submission.type === 'URL_DELETED') {
@@ -429,9 +433,13 @@ app.get('/submit', async (c) => {
       }
     }
     results.push({ url: submission.url, type: submission.type, ...result });
+    if (!result.success && result.error?.startsWith('429')) {
+      await markIndexingQuotaExhausted(c.env.DB, INDEXING_DAILY_QUOTA);
+      break;
+    }
     await sleep(500);
   }
-  return c.json({ property: currentProperty.id, submittedToday, remaining, results });
+  return c.json({ property: currentProperty.id, attemptsUsed, remaining, results });
 });
 
 // ---- CSV export ----
@@ -851,12 +859,16 @@ export async function runIndexingSubmissions(
   const properties = await getProperties(db);
   if (properties.length === 0) return;
 
+  // Global budget = Google's ledger: attempts (not successes) in Google's
+  // quota day (midnight Pacific). Per-property fairness below stays
+  // success-based — it's about how the quota is *distributed*, while this cap
+  // is about how much of it exists.
+  const attemptsUsed = await getIndexingAttemptsToday(db);
+  let budget = Math.min(INDEXING_DAILY_QUOTA - attemptsUsed, INDEXING_BATCH_PER_RUN);
+  if (budget <= 0) return;
+
   const usedByProp = await getIndexingSubmittedTodayByProperty(db);
   const used = (id: string) => usedByProp.get(id) ?? 0;
-  const usedTotal = Array.from(usedByProp.values()).reduce((a, b) => a + b, 0);
-
-  let budget = Math.min(INDEXING_DAILY_QUOTA - usedTotal, INDEXING_BATCH_PER_RUN);
-  if (budget <= 0) return;
 
   const share = Math.floor(INDEXING_DAILY_QUOTA / properties.length);
   const order = [...properties].sort((a, b) => used(a.id) - used(b.id));
@@ -864,21 +876,49 @@ export async function runIndexingSubmissions(
   // so without this a failure would be retried in round 2 of the same run.
   const attempted = new Set<string>();
 
+  // Per-property outcome log, recorded as 'submit' activity rows at the end —
+  // failures used to vanish silently, making quota burn invisible.
+  const startedAt = new Date().toISOString();
+  interface SubmitOutcome { attempted: number; succeeded: number; failures: string[]; quotaExhausted: boolean }
+  const outcomes = new Map<string, SubmitOutcome>();
+  const outcomeFor = (id: string): SubmitOutcome => {
+    let o = outcomes.get(id);
+    if (!o) outcomes.set(id, (o = { attempted: 0, succeeded: 0, failures: [], quotaExhausted: false }));
+    return o;
+  };
+
   const submitFor = async (prop: Property, allowance: number): Promise<void> => {
     const cap = Math.min(allowance, budget);
     if (cap <= 0) return;
     const candidates = (await getUrlsToSubmit(db, prop.id, cap + attempted.size))
       .filter((s) => !attempted.has(s.url))
       .slice(0, cap);
+    const outcome = outcomeFor(prop.id);
     for (const s of candidates) {
       attempted.add(s.url);
       budget--;
+      outcome.attempted++;
+      await recordIndexingAttempt(db);
       const result = await submit(s.url, s.type, env.GSC_CLIENT_EMAIL, env.GSC_PRIVATE_KEY);
       if (result.success) {
+        outcome.succeeded++;
         if (s.type === 'URL_DELETED') {
           await deleteRemovedUrl(db, s.url, prop.id);
         } else {
           await recordIndexingSubmission(db, s.url);
+        }
+      } else {
+        if (outcome.failures.length < 5) {
+          outcome.failures.push(`${s.url} → ${(result.error || 'unknown error').slice(0, 120)}`);
+        }
+        if (result.error?.startsWith('429')) {
+          // Google says the day's quota is gone — clamp the ledger and stop,
+          // so later runs skip submissions entirely until the Pacific-midnight
+          // reset instead of burning their batches on doomed retries.
+          await markIndexingQuotaExhausted(db, INDEXING_DAILY_QUOTA);
+          outcome.quotaExhausted = true;
+          budget = 0;
+          return;
         }
       }
       await sleep(delayMs);
@@ -900,6 +940,21 @@ export async function runIndexingSubmissions(
   for (const prop of order) {
     if (budget <= 0) break;
     await submitFor(prop, budget);
+  }
+
+  // Record one 'submit' activity row per property that had attempts, so
+  // submission outcomes (and failure reasons) show up on /runs.
+  const finishedAt = new Date().toISOString();
+  for (const [propId, o] of outcomes) {
+    if (o.attempted === 0) continue;
+    const details: Record<string, string | number> = {
+      attempted: o.attempted,
+      succeeded: o.succeeded,
+      failed: o.attempted - o.succeeded,
+    };
+    if (o.failures.length > 0) details.failures = o.failures.join(' | ');
+    if (o.quotaExhausted) details.quota_exhausted = 1;
+    await recordActivity(db, propId, 'submit', startedAt, finishedAt, details).catch(() => {});
   }
 }
 

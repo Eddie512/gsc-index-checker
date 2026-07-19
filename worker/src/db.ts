@@ -526,7 +526,7 @@ export interface UrlRow {
   traffic: number;
 }
 
-export type RunType = 'inspect' | 'sync' | 'scrape';
+export type RunType = 'inspect' | 'sync' | 'scrape' | 'submit';
 
 export interface RunRow {
   id: number;
@@ -721,19 +721,46 @@ export async function syncNoindexMismatches(
 // Indexing API tracking
 // ---------------------------------------------------------------------------
 
-/** Count how many indexing submissions have been made today (UTC) — global across all properties. */
-export async function getIndexingSubmittedToday(
-  db: D1Database
-): Promise<number> {
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-  const result = await db
+/** Google's Indexing API quota day: resets at midnight Pacific, not UTC.
+ * en-CA locale renders as YYYY-MM-DD; the timezone API keeps DST correct. */
+export function currentQuotaDay(): string {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+}
+
+/** How many Indexing API publish attempts we've made in Google's current
+ * quota day. Attempts, not successes — Google's quota counts every request,
+ * including failures, so success-based accounting overshoots and burns the
+ * remainder of the day on doomed retries. */
+export async function getIndexingAttemptsToday(db: D1Database): Promise<number> {
+  const row = await db
+    .prepare('SELECT attempts FROM indexing_quota WHERE day = ?')
+    .bind(currentQuotaDay())
+    .first<{ attempts: number }>();
+  return row?.attempts ?? 0;
+}
+
+/** Count one publish attempt against the current quota day. */
+export async function recordIndexingAttempt(db: D1Database): Promise<void> {
+  await db
     .prepare(
-      `SELECT COUNT(*) AS c FROM urls
-       WHERE indexing_submitted_at >= ? AND indexing_submitted_at < ?`
+      `INSERT INTO indexing_quota (day, attempts) VALUES (?, 1)
+       ON CONFLICT(day) DO UPDATE SET attempts = attempts + 1`
     )
-    .bind(`${today}T00:00:00Z`, `${today}T23:59:59Z`)
-    .first<{ c: number }>();
-  return result?.c || 0;
+    .bind(currentQuotaDay())
+    .run();
+}
+
+/** Google answered 429: clamp the day to the full quota so every later run
+ * skips submissions until the Pacific-midnight reset instead of re-attempting
+ * the same candidates on each cron tick. */
+export async function markIndexingQuotaExhausted(db: D1Database, quota: number): Promise<void> {
+  await db
+    .prepare(
+      `INSERT INTO indexing_quota (day, attempts) VALUES (?, ?)
+       ON CONFLICT(day) DO UPDATE SET attempts = MAX(attempts, excluded.attempts)`
+    )
+    .bind(currentQuotaDay(), quota)
+    .run();
 }
 
 /** Per-property breakdown of today's (UTC) indexing submissions. */
@@ -1358,6 +1385,7 @@ export async function cleanupOldAnalytics(db: D1Database): Promise<{ sessions: n
     db.prepare("DELETE FROM http_events WHERE ts < datetime('now', '-30 days')").run(),
     db.prepare("DELETE FROM check_runs WHERE started_at < datetime('now', '-30 days')").run(),
     db.prepare("DELETE FROM pageview_daily WHERE day < date('now', '-30 days')").run(),
+    db.prepare("DELETE FROM indexing_quota WHERE day < date('now', '-30 days')").run(),
   ]);
   return {
     sessions: s.meta?.changes ?? 0,

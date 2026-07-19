@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS http_events (
   ts          TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS indexing_quota (
+  day      TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS deleted_urls (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,
   url                   TEXT NOT NULL,
