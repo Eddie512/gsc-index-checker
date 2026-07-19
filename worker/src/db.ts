@@ -85,7 +85,9 @@ export async function deleteProperty(
 /** Batch-insert URLs for a property (more efficient for large sitemap syncs).
  * Accepts sitemap entries with lastmod; sitemap_lastmod only ever advances
  * (the conflict clause ignores older or missing values), so it records the
- * newest change the sitemap has ever declared for the URL. */
+ * newest change the sitemap has ever declared for the URL. An advance also
+ * resets indexing_submit_count: a new content version gets a fresh submission
+ * budget and restarts the backoff ladder. */
 export async function upsertUrls(
   db: D1Database,
   propertyId: string,
@@ -101,7 +103,9 @@ export async function upsertUrls(
       db
         .prepare(
           `INSERT INTO urls (url, property_id, sitemap_lastmod, first_seen_at, created_at) VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(url, property_id) DO UPDATE SET sitemap_lastmod = excluded.sitemap_lastmod
+           ON CONFLICT(url, property_id) DO UPDATE SET
+             sitemap_lastmod = excluded.sitemap_lastmod,
+             indexing_submit_count = 0
            WHERE excluded.sitemap_lastmod IS NOT NULL
              AND (sitemap_lastmod IS NULL OR excluded.sitemap_lastmod > sitemap_lastmod)`
         )
@@ -655,10 +659,16 @@ export async function syncContentUpdatedDates(
 
   for (let i = 0; i < entries.length; i += batchSize) {
     const batch = entries.slice(i, i + batchSize);
+    // Advance-only, mirroring sitemap_lastmod: a newer scraped date is a new
+    // content version, so it also resets the submission budget. Older or equal
+    // dates are no-ops (rewinding could hide a change from the submit gate).
     const statements = batch.map(([url, date]) =>
       db
-        .prepare('UPDATE urls SET content_updated_at = ? WHERE url = ?')
-        .bind(date, url)
+        .prepare(
+          `UPDATE urls SET content_updated_at = ?, indexing_submit_count = 0
+           WHERE url = ? AND (content_updated_at IS NULL OR ? > content_updated_at)`
+        )
+        .bind(date, url, date)
     );
     await db.batch(statements);
     updated += batch.length;
@@ -691,9 +701,6 @@ export interface UrlSubmission {
   type: 'URL_UPDATED' | 'URL_DELETED';
 }
 
-/** Maximum number of times a URL can be submitted before giving up. */
-const MAX_SUBMIT_COUNT = 3;
-
 /**
  *  Get URLs to submit to the Indexing API, ordered by priority:
  *  1. URLs removed from sitemap that were indexed → URL_DELETED
@@ -701,27 +708,31 @@ const MAX_SUBMIT_COUNT = 3;
  *  3. Stale pages (sitemap lastmod or scraped content date newer than
  *     Google's last crawl) → URL_UPDATED
  *
- * Scoped by property. Uses exponential backoff: cooldown = 7 × 2^(count-1) days.
- * Stops resubmitting after MAX_SUBMIT_COUNT attempts. URL_UPDATED resubmissions
- * additionally require the page to have changed since the last submission
- * (sitemap lastmod / content date advanced) — if Google ignored a submission
- * and nothing changed, resubmitting the same bytes won't change its mind.
- * URLs with no change signal at all keep the plain backoff ladder.
+ * Scoped by property. There is no lifetime submission cap — the attempt budget
+ * is per content version:
+ *  - URL_UPDATED resubmissions require the page to have changed since the last
+ *    submission (sitemap lastmod / content date advanced) — if Google ignored
+ *    a submission and nothing changed, resubmitting the same bytes won't
+ *    change its mind.
+ *  - indexing_submit_count resets whenever a change signal advances (see
+ *    upsertUrls / syncContentUpdatedDates), restarting the backoff ladder for
+ *    the new version.
+ *  - URLs with no change signal retry on the ladder indefinitely; the doubling
+ *    cooldown (7d → 14d → 28d → …) retires them gradually instead of a hard
+ *    stop.
  */
 export async function getUrlsToSubmit(
   db: D1Database,
   propertyId: string,
   limit: number
 ): Promise<UrlSubmission[]> {
-  // Exponential backoff filter:
-  // - Skip URLs that have been submitted MAX_SUBMIT_COUNT or more times
-  // - Cooldown = 7 * 2^(submit_count - 1) days, e.g. 7d → 14d → 28d
+  // Exponential backoff between attempts for the current content version:
+  // cooldown = 7 * 2^(submit_count - 1) days, e.g. 7d → 14d → 28d → …
   const backoffFilter = `
-    AND indexing_submit_count < ${MAX_SUBMIT_COUNT}
     AND (
       indexing_submitted_at IS NULL
       OR julianday('now') - julianday(indexing_submitted_at)
-         >= 7.0 * (1 << MAX(indexing_submit_count - 1, 0))
+         >= 7.0 * (1 << MIN(MAX(indexing_submit_count - 1, 0), 30))
     )`;
 
   // Newest change signal we have for a page ('' when we have none). All three
