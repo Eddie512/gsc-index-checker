@@ -915,6 +915,11 @@ export default {
 
     // :00/:30 = sitemap sync + pageview rollup refresh + (hourly) retention
     if (minute === 0 || minute === 30) {
+      // Both cron triggers fire at :00 and :30 (*/7 hits minute 0 too, and
+      // Cloudflare delivers one event per matching cron). The sync cron owns
+      // these ticks; drop the overlapping */7 event so the whole sync
+      // pipeline doesn't run twice concurrently.
+      if (event.cron === '*/7 * * * *') return;
       ctx.waitUntil(
         Promise.all([
           handleSync(env),

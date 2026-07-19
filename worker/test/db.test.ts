@@ -633,6 +633,41 @@ describe('db — indexing submission backoff', () => {
     expect(await syncNoindexMismatches(env.DB, P, ['https://example.com/page1'])).toBe(0);
   });
 
+  it('upsertUrls works on the legacy prod table shape (PK on url only + migration 0007 index)', async () => {
+    // Production's urls table predates multi-property support: PRIMARY KEY
+    // (url) with property_id bolted on via ALTER. ON CONFLICT(url, property_id)
+    // is only valid there because migration 0007 adds a matching unique index.
+    // Recreate that exact shape and prove the sitemap upsert works against it.
+    await env.DB.prepare('DROP TABLE urls').run();
+    await env.DB
+      .prepare(
+        `CREATE TABLE urls (
+           url TEXT PRIMARY KEY, last_crawl_time TEXT, index_status TEXT,
+           coverage_state TEXT, crawl_status TEXT, page_fetch_state TEXT,
+           robots_status TEXT, last_checked_at TEXT, first_seen_at TEXT,
+           created_at TEXT DEFAULT (datetime('now')), label TEXT DEFAULT NULL,
+           content_updated_at TEXT, indexing_submitted_at TEXT,
+           property_id TEXT DEFAULT 'holidaycalendar', removed_from_sitemap_at TEXT,
+           indexing_submit_count INTEGER DEFAULT 0, referring_urls TEXT,
+           content_scraped_at TEXT, sitemap_lastmod TEXT)`
+      )
+      .run();
+    await env.DB
+      .prepare('CREATE UNIQUE INDEX idx_urls_url_property ON urls(url, property_id)')
+      .run();
+
+    // Insert, then advance lastmod — the exact sequence prod syncs run.
+    await upsertUrls(env.DB, P, [{ url: 'https://example.com/legacy', lastmod: '2026-07-01T00:00:00.000Z' }]);
+    await upsertUrls(env.DB, P, [{ url: 'https://example.com/legacy', lastmod: '2026-07-10T00:00:00.000Z' }]);
+
+    const row = await env.DB
+      .prepare('SELECT sitemap_lastmod, property_id FROM urls WHERE url = ?')
+      .bind('https://example.com/legacy')
+      .first<{ sitemap_lastmod: string; property_id: string }>();
+    expect(row!.sitemap_lastmod).toBe('2026-07-10T00:00:00.000Z');
+    expect(row!.property_id).toBe(P);
+  });
+
   it('upsertUrls only ever advances sitemap_lastmod', async () => {
     const read = () =>
       env.DB.prepare('SELECT sitemap_lastmod FROM urls WHERE url = ?')
