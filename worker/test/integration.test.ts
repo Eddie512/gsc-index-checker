@@ -460,6 +460,79 @@ describe('runIndexingSubmissions — fair quota sharing', () => {
     expect(calls['www.prop-b.com']).toBeUndefined();
   });
 
+  it('counts every attempt against the quota ledger', async () => {
+    await seedProperty('prop-a', 20);
+    await env.DB.prepare(`DELETE FROM properties WHERE id = 'test-prop'`).run();
+
+    const { testEnv, submit } = fakeEnv();
+    await runIndexingSubmissions(testEnv, submit as any, 0);
+
+    const row = await env.DB
+      .prepare('SELECT attempts FROM indexing_quota')
+      .first<{ attempts: number }>();
+    expect(row!.attempts).toBe(10);
+  });
+
+  it('halts on 429 and suppresses submissions until the quota day resets', async () => {
+    await seedProperty('prop-a', 20);
+    await seedProperty('prop-b', 20);
+    await env.DB.prepare(`DELETE FROM properties WHERE id = 'test-prop'`).run();
+
+    let calls = 0;
+    const rateLimited = async () => {
+      calls++;
+      return { success: false, error: '429: Quota exceeded for quota metric' };
+    };
+    const testEnv = { ...env, GSC_CLIENT_EMAIL: 'x', GSC_PRIVATE_KEY: 'y' } as any;
+
+    // First 429 stops the entire run — one attempt, not a full batch.
+    await runIndexingSubmissions(testEnv, rateLimited as any, 0);
+    expect(calls).toBe(1);
+
+    // The day is clamped to the full quota, so the next run doesn't submit at all.
+    const row = await env.DB
+      .prepare('SELECT attempts FROM indexing_quota')
+      .first<{ attempts: number }>();
+    expect(row!.attempts).toBe(200);
+
+    await runIndexingSubmissions(testEnv, rateLimited as any, 0);
+    expect(calls).toBe(1);
+
+    // The outcome (including quota exhaustion) is logged as a 'submit' run.
+    const activity = await env.DB
+      .prepare(`SELECT details FROM check_runs WHERE run_type = 'submit' AND property_id = 'prop-a'`)
+      .first<{ details: string }>();
+    const details = JSON.parse(activity!.details);
+    expect(details.failed).toBe(1);
+    expect(details.quota_exhausted).toBe(1);
+    expect(details.failures).toContain('429');
+  });
+
+  it('logs submission outcomes per property to the activity feed', async () => {
+    await seedProperty('prop-a', 3);
+    await env.DB.prepare(`DELETE FROM properties WHERE id = 'test-prop'`).run();
+
+    // Two succeed, one fails with a permission error.
+    let n = 0;
+    const flaky = async () => {
+      n++;
+      return n === 2
+        ? { success: false, error: '403: Permission denied on resource' }
+        : { success: true };
+    };
+    const testEnv = { ...env, GSC_CLIENT_EMAIL: 'x', GSC_PRIVATE_KEY: 'y' } as any;
+    await runIndexingSubmissions(testEnv, flaky as any, 0);
+
+    const activity = await env.DB
+      .prepare(`SELECT details FROM check_runs WHERE run_type = 'submit' AND property_id = 'prop-a'`)
+      .first<{ details: string }>();
+    const details = JSON.parse(activity!.details);
+    expect(details.attempted).toBe(3);
+    expect(details.succeeded).toBe(2);
+    expect(details.failed).toBe(1);
+    expect(details.failures).toContain('403');
+  });
+
   it('a property at its daily share only receives leftovers', async () => {
     await seedProperty('prop-a', 20);
     await seedProperty('prop-b', 3);
