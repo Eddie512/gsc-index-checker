@@ -4,7 +4,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
-import worker, { pickPropertyToInspect } from '../src/index';
+import worker, { pickPropertyToInspect, runIndexingSubmissions } from '../src/index';
 import { rebuildPageviewRollup } from '../src/db';
 import { initDb, cleanDb } from './helpers';
 
@@ -343,6 +343,94 @@ describe('Worker crawler guard', () => {
     );
     await waitOnExecutionContext(ctx);
     expect(response.status).toBe(200);
+  });
+});
+
+describe('runIndexingSubmissions — fair quota sharing', () => {
+  // Seed a second property plus N unknown-coverage (eligible) URLs per property.
+  async function seedProperty(id: string, candidates: number) {
+    await env.DB
+      .prepare(`INSERT OR IGNORE INTO properties (id, name, site_url, domain) VALUES (?, ?, ?, ?)`)
+      .bind(id, id, `sc-domain:${id}.com`, `www.${id}.com`)
+      .run();
+    for (let i = 0; i < candidates; i++) {
+      await env.DB
+        .prepare(
+          `INSERT INTO urls (url, property_id, coverage_state, first_seen_at, created_at)
+           VALUES (?, ?, 'URL is unknown to Google', datetime('now'), datetime('now'))`
+        )
+        .bind(`https://www.${id}.com/p${i}`, id)
+        .run();
+    }
+  }
+
+  function fakeEnv() {
+    const calls: Record<string, number> = {};
+    const submit = async (url: string) => {
+      const host = new URL(url).hostname;
+      calls[host] = (calls[host] ?? 0) + 1;
+      return { success: true };
+    };
+    return { calls, testEnv: { ...env, GSC_CLIENT_EMAIL: 'x', GSC_PRIVATE_KEY: 'y' } as any, submit };
+  }
+
+  beforeEach(async () => {
+    await initDb(env.DB);
+    await cleanDb(env.DB);
+    await env.DB.prepare(`DELETE FROM properties WHERE id != 'test-prop'`).run();
+    await env.DB.prepare('DELETE FROM urls').run();
+  });
+
+  it('splits a run evenly when both properties have demand', async () => {
+    await seedProperty('prop-a', 20);
+    await seedProperty('prop-b', 20);
+    await env.DB.prepare(`DELETE FROM properties WHERE id = 'test-prop'`).run();
+
+    const { calls, testEnv, submit } = fakeEnv();
+    await runIndexingSubmissions(testEnv, submit as any, 0);
+
+    // Batch of 10, two properties under their share → 5 each.
+    expect(calls['www.prop-a.com']).toBe(5);
+    expect(calls['www.prop-b.com']).toBe(5);
+  });
+
+  it('donates unused share to the property with demand', async () => {
+    await seedProperty('prop-a', 20);
+    await seedProperty('prop-b', 0);
+    await env.DB.prepare(`DELETE FROM properties WHERE id = 'test-prop'`).run();
+
+    const { calls, testEnv, submit } = fakeEnv();
+    await runIndexingSubmissions(testEnv, submit as any, 0);
+
+    // prop-b has nothing to submit → prop-a takes the whole batch.
+    expect(calls['www.prop-a.com']).toBe(10);
+    expect(calls['www.prop-b.com']).toBeUndefined();
+  });
+
+  it('a property at its daily share only receives leftovers', async () => {
+    await seedProperty('prop-a', 20);
+    await seedProperty('prop-b', 3);
+    await env.DB.prepare(`DELETE FROM properties WHERE id = 'test-prop'`).run();
+    // Mark prop-a as having already used its 100/day share (2 properties →
+    // share = 100): 100 URLs submitted today.
+    const now = new Date().toISOString();
+    for (let i = 0; i < 100; i++) {
+      await env.DB
+        .prepare(
+          `INSERT INTO urls (url, property_id, coverage_state, indexing_submitted_at, indexing_submit_count, first_seen_at, created_at)
+           VALUES (?, 'prop-a', 'URL is unknown to Google', ?, 1, datetime('now'), datetime('now'))`
+        )
+        .bind(`https://www.prop-a.com/used${i}`, now)
+        .run();
+    }
+
+    const { calls, testEnv, submit } = fakeEnv();
+    await runIndexingSubmissions(testEnv, submit as any, 0);
+
+    // Round 1: only prop-b is under its share → its 3 candidates.
+    // Round 2: leftovers go to prop-a despite being at its share.
+    expect(calls['www.prop-b.com']).toBe(3);
+    expect(calls['www.prop-a.com']).toBe(7);
   });
 });
 

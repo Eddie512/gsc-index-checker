@@ -37,6 +37,7 @@ import {
   syncContentUpdatedDates,
   syncNoindexMismatches,
   getIndexingSubmittedToday,
+  getIndexingSubmittedTodayByProperty,
   getUrlsToSubmit,
   recordIndexingSubmission,
   deleteRemovedUrl,
@@ -744,30 +745,7 @@ async function handleInspect(env: Env): Promise<void> {
 
   // Indexing API submissions
   try {
-    const submittedToday = await getIndexingSubmittedToday(db);
-    const remaining = Math.max(0, INDEXING_DAILY_QUOTA - submittedToday);
-
-    if (remaining > 0) {
-      const batchLimit = Math.min(remaining, INDEXING_BATCH_PER_RUN);
-      const perProperty = Math.max(1, Math.floor(batchLimit / properties.length));
-
-      for (const prop of properties) {
-        const urlsToSubmit = await getUrlsToSubmit(db, prop.id, perProperty);
-        if (urlsToSubmit.length === 0) continue;
-
-        for (const submission of urlsToSubmit) {
-          const result = await submitUrl(submission.url, submission.type, env.GSC_CLIENT_EMAIL, env.GSC_PRIVATE_KEY);
-          if (result.success) {
-            if (submission.type === 'URL_DELETED') {
-              await deleteRemovedUrl(db, submission.url, prop.id);
-            } else {
-              await recordIndexingSubmission(db, submission.url);
-            }
-          }
-          await sleep(500);
-        }
-      }
-    }
+    await runIndexingSubmissions(env);
   } catch {
     // Indexing API step failed — non-critical, recorded in next run
   }
@@ -810,25 +788,81 @@ async function handleInspectProperty(env: Env, propertyId: string): Promise<void
   await recordRun(db, prop.id, startedAt, finishedAt, stats.checked, stats.indexed, stats.notIndexed, stats.errors, runDetails);
 
   try {
-    const submittedToday = await getIndexingSubmittedToday(db);
-    const remaining = Math.max(0, INDEXING_DAILY_QUOTA - submittedToday);
-    if (remaining > 0) {
-      const batchLimit = Math.min(remaining, INDEXING_BATCH_PER_RUN);
-      const urlsToSubmit = await getUrlsToSubmit(db, prop.id, batchLimit);
-      for (const submission of urlsToSubmit) {
-        const result = await submitUrl(submission.url, submission.type, env.GSC_CLIENT_EMAIL, env.GSC_PRIVATE_KEY);
-        if (result.success) {
-          if (submission.type === 'URL_DELETED') {
-            await deleteRemovedUrl(db, submission.url, prop.id);
-          } else {
-            await recordIndexingSubmission(db, submission.url);
-          }
-        }
-        await sleep(500);
-      }
-    }
+    await runIndexingSubmissions(env);
   } catch {
     // Indexing API step failed — non-critical
+  }
+}
+
+/**
+ * Submit eligible URLs to the Indexing API with max-min fair quota sharing.
+ *
+ * Every property is guaranteed an equal slice of the daily quota
+ * (INDEXING_DAILY_QUOTA / #properties); a property that can't fill its slice
+ * (no eligible candidates) implicitly donates the surplus, which round 2 hands
+ * to properties that still have demand. Ordering is least-served-today first,
+ * so imbalances self-correct across the day's runs rather than compounding.
+ *
+ * `submit` and `delayMs` are injectable for tests.
+ */
+export async function runIndexingSubmissions(
+  env: Env,
+  submit: typeof submitUrl = submitUrl,
+  delayMs: number = 500
+): Promise<void> {
+  const db = env.DB;
+  const properties = await getProperties(db);
+  if (properties.length === 0) return;
+
+  const usedByProp = await getIndexingSubmittedTodayByProperty(db);
+  const used = (id: string) => usedByProp.get(id) ?? 0;
+  const usedTotal = Array.from(usedByProp.values()).reduce((a, b) => a + b, 0);
+
+  let budget = Math.min(INDEXING_DAILY_QUOTA - usedTotal, INDEXING_BATCH_PER_RUN);
+  if (budget <= 0) return;
+
+  const share = Math.floor(INDEXING_DAILY_QUOTA / properties.length);
+  const order = [...properties].sort((a, b) => used(a.id) - used(b.id));
+  // URLs attempted this run — a failed submission stays an eligible candidate,
+  // so without this a failure would be retried in round 2 of the same run.
+  const attempted = new Set<string>();
+
+  const submitFor = async (prop: Property, allowance: number): Promise<void> => {
+    const cap = Math.min(allowance, budget);
+    if (cap <= 0) return;
+    const candidates = (await getUrlsToSubmit(db, prop.id, cap + attempted.size))
+      .filter((s) => !attempted.has(s.url))
+      .slice(0, cap);
+    for (const s of candidates) {
+      attempted.add(s.url);
+      budget--;
+      const result = await submit(s.url, s.type, env.GSC_CLIENT_EMAIL, env.GSC_PRIVATE_KEY);
+      if (result.success) {
+        if (s.type === 'URL_DELETED') {
+          await deleteRemovedUrl(db, s.url, prop.id);
+        } else {
+          await recordIndexingSubmission(db, s.url);
+        }
+      }
+      await sleep(delayMs);
+    }
+  };
+
+  // Round 1: guaranteed shares — this run's batch sliced evenly across
+  // properties still under their daily share.
+  const unmet = order.filter((p) => used(p.id) < share);
+  if (unmet.length > 0) {
+    const slice = Math.max(1, Math.floor(budget / unmet.length));
+    for (const prop of unmet) {
+      await submitFor(prop, Math.min(slice, share - used(prop.id)));
+    }
+  }
+
+  // Round 2: leftovers (donated shares, rounding remainders) go to any
+  // property that still has eligible candidates, least-served first.
+  for (const prop of order) {
+    if (budget <= 0) break;
+    await submitFor(prop, budget);
   }
 }
 
