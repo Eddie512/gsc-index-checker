@@ -1,8 +1,14 @@
 /**
- * Sitemap parser — fetches a sitemap (index or direct) and extracts all URLs.
+ * Sitemap parser — fetches a sitemap (index or direct) and extracts all URLs
+ * with their <lastmod> dates (normalized to ISO, null when absent/invalid).
  */
 
 const USER_AGENT = 'GSCIndexChecker/1.0 (+https://github.com/anthropics/gsc-index-checker)';
+
+export interface SitemapEntry {
+  url: string;
+  lastmod: string | null;
+}
 
 /** Extract text content from XML elements matching a simple tag name. */
 function extractTag(xml: string, tag: string): string[] {
@@ -15,13 +21,37 @@ function extractTag(xml: string, tag: string): string[] {
   return results;
 }
 
+/** Normalize a <lastmod> value (date-only or full timestamp) to ISO, or null. */
+function normalizeLastmod(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const d = new Date(raw.trim());
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/** Parse <url> blocks from a urlset, pairing each <loc> with its <lastmod>. */
+function extractEntries(xml: string): SitemapEntry[] {
+  const entries: SitemapEntry[] = [];
+  const blockRegex = /<url[\s>][\s\S]*?<\/url>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = blockRegex.exec(xml)) !== null) {
+    const block = match[0];
+    const loc = /<loc[^>]*>([^<]+)<\/loc>/i.exec(block);
+    if (!loc) continue;
+    const lastmod = /<lastmod[^>]*>([^<]+)<\/lastmod>/i.exec(block);
+    entries.push({ url: loc[1].trim(), lastmod: normalizeLastmod(lastmod?.[1]) });
+  }
+  if (entries.length > 0) return entries;
+  // Fallback for malformed sitemaps without <url> blocks: bare <loc> tags.
+  return extractTag(xml, 'loc').map((url) => ({ url, lastmod: null }));
+}
+
 /**
- * Fetch and parse a sitemap, returning all page URLs.
+ * Fetch and parse a sitemap, returning all page URLs with lastmod dates.
  * Supports both sitemap index files and single sitemaps.
  */
 export async function getAllUrlsFromSitemap(
   sitemapUrl: string
-): Promise<string[]> {
+): Promise<SitemapEntry[]> {
   const response = await fetch(sitemapUrl, {
     headers: { 'User-Agent': USER_AGENT },
   });
@@ -33,17 +63,16 @@ export async function getAllUrlsFromSitemap(
   const xml = await response.text();
 
   // Check if this is a sitemap index (contains <sitemap> elements)
-  const sitemapUrls = extractTag(xml, 'loc');
   const isSitemapIndex = xml.includes('<sitemapindex');
 
   if (!isSitemapIndex) {
-    // Direct sitemap — return the URLs directly
-    return sitemapUrls;
+    // Direct sitemap — return the entries directly
+    return extractEntries(xml);
   }
 
   // Sitemap index — fetch each sub-sitemap
-  const allUrls: string[] = [];
-  for (const subUrl of sitemapUrls) {
+  const allEntries: SitemapEntry[] = [];
+  for (const subUrl of extractTag(xml, 'loc')) {
     try {
       const subResponse = await fetch(subUrl, {
         headers: { 'User-Agent': USER_AGENT },
@@ -52,11 +81,11 @@ export async function getAllUrlsFromSitemap(
       if (!subResponse.ok) continue;
 
       const subXml = await subResponse.text();
-      allUrls.push(...extractTag(subXml, 'loc'));
+      allEntries.push(...extractEntries(subXml));
     } catch {
       // Skip unreachable sub-sitemaps
     }
   }
 
-  return allUrls;
+  return allEntries;
 }

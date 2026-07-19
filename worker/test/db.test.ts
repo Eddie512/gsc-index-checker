@@ -21,6 +21,8 @@ import {
   deleteRemovedUrl,
   getPathTraffic,
   rebuildPageviewRollup,
+  syncContentUpdatedDates,
+  syncNoindexMismatches,
 } from '../src/db';
 import { initDb, cleanDb, TEST_PROPERTY_ID } from './helpers';
 
@@ -478,14 +480,15 @@ describe('db — indexing submission backoff', () => {
     expect(row!.indexing_submitted_at).toBeTruthy();
   });
 
-  it('skips URLs at max submissions (count >= 3)', async () => {
-    // Manually set count to 3
+  it('has no lifetime cap: high-count URLs still retry once their backoff elapses', async () => {
+    // count=3 → cooldown 28 days; submitted years ago, no change signal →
+    // still eligible (the doubling ladder retires URLs gradually, not hard).
     await env.DB
       .prepare('UPDATE urls SET indexing_submit_count = 3, indexing_submitted_at = ? WHERE url = ?')
       .bind('2020-01-01T00:00:00Z', 'https://example.com/page1')
       .run();
     const urls = await getUrlsToSubmit(env.DB, P, 10);
-    expect(urls.length).toBe(0);
+    expect(urls.length).toBe(1);
   });
 
   it('skips URLs within backoff window', async () => {
@@ -509,6 +512,144 @@ describe('db — indexing submission backoff', () => {
       .run();
     const urls = await getUrlsToSubmit(env.DB, P, 10);
     expect(urls.length).toBe(1);
+  });
+
+  it('skips resubmission when the page has not changed since the last submission', async () => {
+    const daysAgo = (d: number) => new Date(Date.now() - d * 86400000).toISOString();
+    // Past the 7-day cooldown (submitted 10 days ago), but lastmod predates
+    // the submission → Google already saw this version; don't resubmit.
+    await env.DB
+      .prepare('UPDATE urls SET indexing_submit_count = 1, indexing_submitted_at = ?, sitemap_lastmod = ? WHERE url = ?')
+      .bind(daysAgo(10), daysAgo(20), 'https://example.com/page1')
+      .run();
+    const urls = await getUrlsToSubmit(env.DB, P, 10);
+    expect(urls.length).toBe(0);
+  });
+
+  it('resubmits when sitemap lastmod advanced past the last submission', async () => {
+    const daysAgo = (d: number) => new Date(Date.now() - d * 86400000).toISOString();
+    // Past cooldown AND the page changed after the submission → eligible again.
+    await env.DB
+      .prepare('UPDATE urls SET indexing_submit_count = 1, indexing_submitted_at = ?, sitemap_lastmod = ? WHERE url = ?')
+      .bind(daysAgo(10), daysAgo(2), 'https://example.com/page1')
+      .run();
+    const urls = await getUrlsToSubmit(env.DB, P, 10);
+    expect(urls.length).toBe(1);
+    expect(urls[0].type).toBe('URL_UPDATED');
+  });
+
+  it('treats sitemap lastmod newer than last crawl as stale (no scrape needed)', async () => {
+    const daysAgo = (d: number) => new Date(Date.now() - d * 86400000).toISOString();
+    await upsertUrls(env.DB, P, [{ url: 'https://example.com/page2', lastmod: daysAgo(1) }]);
+    // Indexed page, never submitted, no scraped content date — lastmod alone
+    // newer than Google's crawl marks it stale.
+    await env.DB
+      .prepare(`UPDATE urls SET coverage_state = 'Submitted and indexed', last_checked_at = ?, last_crawl_time = ? WHERE url = ?`)
+      .bind(daysAgo(3), daysAgo(5), 'https://example.com/page2')
+      .run();
+    const urls = await getUrlsToSubmit(env.DB, P, 10);
+    const page2 = urls.find((u) => u.url === 'https://example.com/page2');
+    expect(page2?.type).toBe('URL_UPDATED');
+  });
+
+  it('a lastmod advance resets the attempt counter (fresh budget per version)', async () => {
+    const daysAgo = (d: number) => new Date(Date.now() - d * 86400000).toISOString();
+    // Heavily-retried URL: count=5 → cooldown 7×2^4 = 112 days, submitted 10
+    // days ago → blocked on the ladder…
+    await env.DB
+      .prepare('UPDATE urls SET indexing_submit_count = 5, indexing_submitted_at = ?, sitemap_lastmod = ? WHERE url = ?')
+      .bind(daysAgo(10), daysAgo(30), 'https://example.com/page1')
+      .run();
+    expect((await getUrlsToSubmit(env.DB, P, 10)).length).toBe(0);
+
+    // …until the sitemap declares a newer version: count resets to 0, so the
+    // baseline 7-day cooldown applies (10 days elapsed → eligible).
+    await upsertUrls(env.DB, P, [{ url: 'https://example.com/page1', lastmod: daysAgo(1) }]);
+    const row = await env.DB
+      .prepare('SELECT indexing_submit_count FROM urls WHERE url = ?')
+      .bind('https://example.com/page1')
+      .first<{ indexing_submit_count: number }>();
+    expect(row!.indexing_submit_count).toBe(0);
+    expect((await getUrlsToSubmit(env.DB, P, 10)).length).toBe(1);
+  });
+
+  it('syncContentUpdatedDates is advance-only and resets the counter on advance', async () => {
+    await env.DB
+      .prepare('UPDATE urls SET indexing_submit_count = 2, content_updated_at = ? WHERE url = ?')
+      .bind('2026-07-05T00:00:00.000Z', 'https://example.com/page1')
+      .run();
+
+    // Older date → no-op (date and count untouched)
+    await syncContentUpdatedDates(env.DB, new Map([['https://example.com/page1', '2026-07-01T00:00:00.000Z']]));
+    let row = await env.DB
+      .prepare('SELECT content_updated_at, indexing_submit_count FROM urls WHERE url = ?')
+      .bind('https://example.com/page1')
+      .first<{ content_updated_at: string; indexing_submit_count: number }>();
+    expect(row!.content_updated_at).toBe('2026-07-05T00:00:00.000Z');
+    expect(row!.indexing_submit_count).toBe(2);
+
+    // Newer date → advances and resets the budget
+    await syncContentUpdatedDates(env.DB, new Map([['https://example.com/page1', '2026-07-10T00:00:00.000Z']]));
+    row = await env.DB
+      .prepare('SELECT content_updated_at, indexing_submit_count FROM urls WHERE url = ?')
+      .bind('https://example.com/page1')
+      .first<{ content_updated_at: string; indexing_submit_count: number }>();
+    expect(row!.content_updated_at).toBe('2026-07-10T00:00:00.000Z');
+    expect(row!.indexing_submit_count).toBe(0);
+  });
+
+  it('syncNoindexMismatches flags stale noindex verdicts as changed, once per crawl generation', async () => {
+    const daysAgo = (d: number) => new Date(Date.now() - d * 86400000).toISOString();
+    // GSC says noindex (as of Google's crawl 30 days ago), but the live page
+    // is indexable — should be flagged as changed and become a candidate.
+    await env.DB
+      .prepare(`UPDATE urls SET coverage_state = 'Excluded by noindex tag', last_checked_at = ?, last_crawl_time = ?, indexing_submit_count = 2 WHERE url = ?`)
+      .bind(daysAgo(1), daysAgo(30), 'https://example.com/page1')
+      .run();
+
+    const flagged = await syncNoindexMismatches(env.DB, P, ['https://example.com/page1']);
+    expect(flagged).toBe(1);
+
+    const row = await env.DB
+      .prepare('SELECT content_updated_at, indexing_submit_count FROM urls WHERE url = ?')
+      .bind('https://example.com/page1')
+      .first<{ content_updated_at: string; indexing_submit_count: number }>();
+    expect(row!.content_updated_at! > daysAgo(30)).toBe(true);
+    expect(row!.indexing_submit_count).toBe(0);
+
+    const candidates = await getUrlsToSubmit(env.DB, P, 10);
+    expect(candidates.some((u) => u.url === 'https://example.com/page1' && u.type === 'URL_UPDATED')).toBe(true);
+
+    // Second pass in the same crawl generation → no re-bump
+    expect(await syncNoindexMismatches(env.DB, P, ['https://example.com/page1'])).toBe(0);
+  });
+
+  it('syncNoindexMismatches leaves non-noindex pages alone', async () => {
+    const daysAgo = (d: number) => new Date(Date.now() - d * 86400000).toISOString();
+    await env.DB
+      .prepare(`UPDATE urls SET coverage_state = 'Submitted and indexed', last_checked_at = ?, last_crawl_time = ? WHERE url = ?`)
+      .bind(daysAgo(1), daysAgo(30), 'https://example.com/page1')
+      .run();
+    expect(await syncNoindexMismatches(env.DB, P, ['https://example.com/page1'])).toBe(0);
+  });
+
+  it('upsertUrls only ever advances sitemap_lastmod', async () => {
+    const read = () =>
+      env.DB.prepare('SELECT sitemap_lastmod FROM urls WHERE url = ?')
+        .bind('https://example.com/page1')
+        .first<{ sitemap_lastmod: string | null }>();
+
+    await upsertUrls(env.DB, P, [{ url: 'https://example.com/page1', lastmod: '2026-07-05T00:00:00.000Z' }]);
+    expect((await read())!.sitemap_lastmod).toBe('2026-07-05T00:00:00.000Z');
+
+    // Older value and missing value are both ignored
+    await upsertUrls(env.DB, P, [{ url: 'https://example.com/page1', lastmod: '2026-07-01T00:00:00.000Z' }]);
+    await upsertUrls(env.DB, P, ['https://example.com/page1']);
+    expect((await read())!.sitemap_lastmod).toBe('2026-07-05T00:00:00.000Z');
+
+    // Newer value advances
+    await upsertUrls(env.DB, P, [{ url: 'https://example.com/page1', lastmod: '2026-07-10T00:00:00.000Z' }]);
+    expect((await read())!.sitemap_lastmod).toBe('2026-07-10T00:00:00.000Z');
   });
 
   it('updateInspection resets count when URL becomes indexed', async () => {

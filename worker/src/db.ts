@@ -82,23 +82,34 @@ export async function deleteProperty(
 // URL operations (all scoped by property_id)
 // ---------------------------------------------------------------------------
 
-/** Batch-insert URLs for a property (more efficient for large sitemap syncs). */
+/** Batch-insert URLs for a property (more efficient for large sitemap syncs).
+ * Accepts sitemap entries with lastmod; sitemap_lastmod only ever advances
+ * (the conflict clause ignores older or missing values), so it records the
+ * newest change the sitemap has ever declared for the URL. An advance also
+ * resets indexing_submit_count: a new content version gets a fresh submission
+ * budget and restarts the backoff ladder. */
 export async function upsertUrls(
   db: D1Database,
   propertyId: string,
-  urls: string[]
+  urls: Array<string | { url: string; lastmod: string | null }>
 ): Promise<void> {
   const now = new Date().toISOString();
   const batchSize = 50;
+  const entries = urls.map((u) => (typeof u === 'string' ? { url: u, lastmod: null } : u));
 
-  for (let i = 0; i < urls.length; i += batchSize) {
-    const batch = urls.slice(i, i + batchSize);
-    const statements = batch.map((url) =>
+  for (let i = 0; i < entries.length; i += batchSize) {
+    const batch = entries.slice(i, i + batchSize);
+    const statements = batch.map((e) =>
       db
         .prepare(
-          `INSERT OR IGNORE INTO urls (url, property_id, first_seen_at, created_at) VALUES (?, ?, ?, ?)`
+          `INSERT INTO urls (url, property_id, sitemap_lastmod, first_seen_at, created_at) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(url, property_id) DO UPDATE SET
+             sitemap_lastmod = excluded.sitemap_lastmod,
+             indexing_submit_count = 0
+           WHERE excluded.sitemap_lastmod IS NOT NULL
+             AND (sitemap_lastmod IS NULL OR excluded.sitemap_lastmod > sitemap_lastmod)`
         )
-        .bind(url, propertyId, now, now)
+        .bind(e.url, propertyId, e.lastmod, now, now)
     );
     await db.batch(statements);
   }
@@ -648,16 +659,62 @@ export async function syncContentUpdatedDates(
 
   for (let i = 0; i < entries.length; i += batchSize) {
     const batch = entries.slice(i, i + batchSize);
+    // Advance-only, mirroring sitemap_lastmod: a newer scraped date is a new
+    // content version, so it also resets the submission budget. Older or equal
+    // dates are no-ops (rewinding could hide a change from the submit gate).
     const statements = batch.map(([url, date]) =>
       db
-        .prepare('UPDATE urls SET content_updated_at = ? WHERE url = ?')
-        .bind(date, url)
+        .prepare(
+          `UPDATE urls SET content_updated_at = ?, indexing_submit_count = 0
+           WHERE url = ? AND (content_updated_at IS NULL OR ? > content_updated_at)`
+        )
+        .bind(date, url, date)
     );
     await db.batch(statements);
     updated += batch.length;
   }
 
   return updated;
+}
+
+/**
+ * Reconcile Google's noindex verdicts against what the live pages actually
+ * serve. GSC's "Excluded by 'noindex' tag" reflects the page at Google's last
+ * crawl — if the site has since removed the tag, Google won't find out until
+ * it happens to recrawl, which can take months. For pages the scraper just
+ * verified as indexable, treat a lingering noindex verdict as a content
+ * change: bump content_updated_at so the stale trigger submits them for
+ * recrawl. The `content_updated_at <= last_crawl_time` guard limits this to
+ * one bump per Google crawl generation — no resubmit loops while waiting.
+ */
+export async function syncNoindexMismatches(
+  db: D1Database,
+  propertyId: string,
+  indexableUrls: string[]
+): Promise<number> {
+  if (indexableUrls.length === 0) return 0;
+  const now = new Date().toISOString();
+  const batchSize = 50;
+  let flagged = 0;
+
+  for (let i = 0; i < indexableUrls.length; i += batchSize) {
+    const batch = indexableUrls.slice(i, i + batchSize);
+    const statements = batch.map((url) =>
+      db
+        .prepare(
+          `UPDATE urls SET content_updated_at = ?, indexing_submit_count = 0
+           WHERE url = ? AND property_id = ?
+             AND coverage_state LIKE '%noindex%'
+             AND last_crawl_time IS NOT NULL
+             AND (content_updated_at IS NULL OR content_updated_at <= last_crawl_time)`
+        )
+        .bind(now, url, propertyId)
+    );
+    const results = await db.batch(statements);
+    for (const r of results) flagged += r.meta?.changes ?? 0;
+  }
+
+  return flagged;
 }
 
 // ---------------------------------------------------------------------------
@@ -684,32 +741,52 @@ export interface UrlSubmission {
   type: 'URL_UPDATED' | 'URL_DELETED';
 }
 
-/** Maximum number of times a URL can be submitted before giving up. */
-const MAX_SUBMIT_COUNT = 3;
-
 /**
  *  Get URLs to submit to the Indexing API, ordered by priority:
  *  1. URLs removed from sitemap that were indexed → URL_DELETED
  *  2. URLs unknown to Google (coverage_state contains 'unknown') → URL_UPDATED
- *  3. Stale pages (content updated after last crawl) → URL_UPDATED
+ *  3. Stale pages (sitemap lastmod or scraped content date newer than
+ *     Google's last crawl) → URL_UPDATED
  *
- * Scoped by property. Uses exponential backoff: cooldown = 7 × 2^(count-1) days.
- * Stops resubmitting after MAX_SUBMIT_COUNT attempts.
+ * Scoped by property. There is no lifetime submission cap — the attempt budget
+ * is per content version:
+ *  - URL_UPDATED resubmissions require the page to have changed since the last
+ *    submission (sitemap lastmod / content date advanced) — if Google ignored
+ *    a submission and nothing changed, resubmitting the same bytes won't
+ *    change its mind.
+ *  - indexing_submit_count resets whenever a change signal advances (see
+ *    upsertUrls / syncContentUpdatedDates), restarting the backoff ladder for
+ *    the new version.
+ *  - URLs with no change signal retry on the ladder indefinitely; the doubling
+ *    cooldown (7d → 14d → 28d → …) retires them gradually instead of a hard
+ *    stop.
  */
 export async function getUrlsToSubmit(
   db: D1Database,
   propertyId: string,
   limit: number
 ): Promise<UrlSubmission[]> {
-  // Exponential backoff filter:
-  // - Skip URLs that have been submitted MAX_SUBMIT_COUNT or more times
-  // - Cooldown = 7 * 2^(submit_count - 1) days, e.g. 7d → 14d → 28d
+  // Exponential backoff between attempts for the current content version:
+  // cooldown = 7 * 2^(submit_count - 1) days, e.g. 7d → 14d → 28d → …
   const backoffFilter = `
-    AND indexing_submit_count < ${MAX_SUBMIT_COUNT}
     AND (
       indexing_submitted_at IS NULL
       OR julianday('now') - julianday(indexing_submitted_at)
-         >= 7.0 * (1 << MAX(indexing_submit_count - 1, 0))
+         >= 7.0 * (1 << MIN(MAX(indexing_submit_count - 1, 0), 30))
+    )`;
+
+  // Newest change signal we have for a page ('' when we have none). All three
+  // columns are ISO-8601 UTC strings, so lexicographic comparison is safe.
+  const changeSignal = `MAX(COALESCE(sitemap_lastmod, ''), COALESCE(content_updated_at, ''))`;
+
+  // Only resubmit a page if it changed since the last submission (or we can't
+  // tell). Not applied to URL_DELETED: removal IS the change, and lastmod
+  // freezes once a URL leaves the sitemap.
+  const changeGate = `
+    AND (
+      indexing_submitted_at IS NULL
+      OR ${changeSignal} = ''
+      OR ${changeSignal} > indexing_submitted_at
     )`;
 
   // Priority 1: URLs removed from sitemap (indexed) → URL_DELETED
@@ -743,16 +820,16 @@ export async function getUrlsToSubmit(
          -- Priority 2: Unknown to Google
          (coverage_state LIKE '%unknown%')
          OR
-         -- Priority 3: Stale pages — only if already inspected
-         -- and Google has an established crawl date
-         (content_updated_at IS NOT NULL
-          AND last_checked_at IS NOT NULL AND last_crawl_time IS NOT NULL
-          AND content_updated_at > last_crawl_time)
+         -- Priority 3: Stale pages — sitemap lastmod or scraped content date
+         -- newer than Google's last crawl; only if already inspected
+         (last_checked_at IS NOT NULL AND last_crawl_time IS NOT NULL
+          AND ${changeSignal} > last_crawl_time)
        )
        ${backoffFilter}
+       ${changeGate}
        ORDER BY
          CASE WHEN coverage_state LIKE '%unknown%' THEN 0 ELSE 1 END,
-         content_updated_at DESC
+         ${changeSignal} DESC
        LIMIT ?`
     )
     .bind(propertyId, remaining)

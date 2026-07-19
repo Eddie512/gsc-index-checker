@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS urls (
   indexing_submitted_at TEXT,
   indexing_submit_count INTEGER DEFAULT 0,
   removed_from_sitemap_at TEXT,
+  sitemap_lastmod  TEXT,
   last_checked_at  TEXT,
   first_seen_at    TEXT,
   created_at       TEXT DEFAULT (datetime('now')),

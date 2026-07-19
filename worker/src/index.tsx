@@ -35,6 +35,7 @@ import {
   updateLabel,
   bulkUpdateLabel,
   syncContentUpdatedDates,
+  syncNoindexMismatches,
   getIndexingSubmittedToday,
   getUrlsToSubmit,
   recordIndexingSubmission,
@@ -651,16 +652,16 @@ async function handleSync(env: Env): Promise<void> {
     if (prop.sitemap_url) {
       const syncStart = new Date().toISOString();
       try {
-        const sitemapUrls = await getAllUrlsFromSitemap(prop.sitemap_url);
-        if (sitemapUrls.length === 0) {
+        const sitemapEntries = await getAllUrlsFromSitemap(prop.sitemap_url);
+        if (sitemapEntries.length === 0) {
           await recordActivity(db, prop.id, 'sync', syncStart, new Date().toISOString(), { urls_found: 0, error: 'empty sitemap' });
           continue;
         }
-        await upsertUrls(db, prop.id, sitemapUrls);
+        await upsertUrls(db, prop.id, sitemapEntries);
 
-        const reconciled = await reconcileUrls(db, prop.id, sitemapUrls);
+        const reconciled = await reconcileUrls(db, prop.id, sitemapEntries.map((e) => e.url));
         await recordActivity(db, prop.id, 'sync', syncStart, new Date().toISOString(), {
-          urls_found: sitemapUrls.length,
+          urls_found: sitemapEntries.length,
           marked_for_deletion: reconciled.markedForDeletion,
           deleted: reconciled.deleted,
           restored: reconciled.restored,
@@ -675,13 +676,16 @@ async function handleSync(env: Env): Promise<void> {
     try {
       const urlsToScrape = await getUrlsForContentScrape(db, prop.id, CONTENT_SCRAPE_BATCH);
       if (urlsToScrape.length > 0) {
-        const { dateMap, stats } = await scrapeContentDates(urlsToScrape);
+        const { dateMap, indexableMap, stats } = await scrapeContentDates(urlsToScrape);
         await markUrlsScraped(db, urlsToScrape);
         const synced = dateMap.size > 0 ? await syncContentUpdatedDates(db, dateMap) : 0;
+        const indexable = urlsToScrape.filter((u) => indexableMap.get(u) === true);
+        const mismatches = await syncNoindexMismatches(db, prop.id, indexable);
         const details: Record<string, string | number> = {
           pages_scraped: stats.scraped,
           dates_found: stats.datesFound,
           dates_synced: synced,
+          noindex_mismatches: mismatches,
           skipped: stats.skipped,
           errors: stats.errors,
         };
