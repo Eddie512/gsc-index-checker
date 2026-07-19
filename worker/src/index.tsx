@@ -35,6 +35,7 @@ import {
   updateLabel,
   bulkUpdateLabel,
   syncContentUpdatedDates,
+  syncNoindexMismatches,
   getIndexingSubmittedToday,
   getUrlsToSubmit,
   recordIndexingSubmission,
@@ -675,13 +676,16 @@ async function handleSync(env: Env): Promise<void> {
     try {
       const urlsToScrape = await getUrlsForContentScrape(db, prop.id, CONTENT_SCRAPE_BATCH);
       if (urlsToScrape.length > 0) {
-        const { dateMap, stats } = await scrapeContentDates(urlsToScrape);
+        const { dateMap, indexableMap, stats } = await scrapeContentDates(urlsToScrape);
         await markUrlsScraped(db, urlsToScrape);
         const synced = dateMap.size > 0 ? await syncContentUpdatedDates(db, dateMap) : 0;
+        const indexable = urlsToScrape.filter((u) => indexableMap.get(u) === true);
+        const mismatches = await syncNoindexMismatches(db, prop.id, indexable);
         const details: Record<string, string | number> = {
           pages_scraped: stats.scraped,
           dates_found: stats.datesFound,
           dates_synced: synced,
+          noindex_mismatches: mismatches,
           skipped: stats.skipped,
           errors: stats.errors,
         };

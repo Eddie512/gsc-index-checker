@@ -677,6 +677,46 @@ export async function syncContentUpdatedDates(
   return updated;
 }
 
+/**
+ * Reconcile Google's noindex verdicts against what the live pages actually
+ * serve. GSC's "Excluded by 'noindex' tag" reflects the page at Google's last
+ * crawl — if the site has since removed the tag, Google won't find out until
+ * it happens to recrawl, which can take months. For pages the scraper just
+ * verified as indexable, treat a lingering noindex verdict as a content
+ * change: bump content_updated_at so the stale trigger submits them for
+ * recrawl. The `content_updated_at <= last_crawl_time` guard limits this to
+ * one bump per Google crawl generation — no resubmit loops while waiting.
+ */
+export async function syncNoindexMismatches(
+  db: D1Database,
+  propertyId: string,
+  indexableUrls: string[]
+): Promise<number> {
+  if (indexableUrls.length === 0) return 0;
+  const now = new Date().toISOString();
+  const batchSize = 50;
+  let flagged = 0;
+
+  for (let i = 0; i < indexableUrls.length; i += batchSize) {
+    const batch = indexableUrls.slice(i, i + batchSize);
+    const statements = batch.map((url) =>
+      db
+        .prepare(
+          `UPDATE urls SET content_updated_at = ?, indexing_submit_count = 0
+           WHERE url = ? AND property_id = ?
+             AND coverage_state LIKE '%noindex%'
+             AND last_crawl_time IS NOT NULL
+             AND (content_updated_at IS NULL OR content_updated_at <= last_crawl_time)`
+        )
+        .bind(now, url, propertyId)
+    );
+    const results = await db.batch(statements);
+    for (const r of results) flagged += r.meta?.changes ?? 0;
+  }
+
+  return flagged;
+}
+
 // ---------------------------------------------------------------------------
 // Indexing API tracking
 // ---------------------------------------------------------------------------

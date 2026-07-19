@@ -39,6 +39,11 @@ const META_PATTERNS = [
   ...metaPatterns('itemprop', 'dateModified'),
 ];
 
+const ROBOTS_META_PATTERNS = [
+  ...metaPatterns('name', 'robots'),
+  ...metaPatterns('name', 'googlebot'),
+];
+
 // JSON-LD dateModified
 const JSONLD_PATTERN = /"dateModified"\s*:\s*"([^"]+)"/;
 
@@ -98,6 +103,26 @@ function extractDate(html: string, headers: Headers): string | null {
 }
 
 /**
+ * Does the page forbid indexing? Checks the X-Robots-Tag header and
+ * robots/googlebot meta tags for a noindex (or none) directive.
+ */
+function isNoindex(html: string, headers: Headers): boolean {
+  const headerVal = headers.get('x-robots-tag')?.toLowerCase() || '';
+  if (headerVal.includes('noindex') || /\bnone\b/.test(headerVal)) return true;
+
+  const headEnd = html.indexOf('</head>');
+  const headHtml = headEnd > 0 ? html.slice(0, headEnd + 7) : html.slice(0, 15000);
+  for (const pattern of ROBOTS_META_PATTERNS) {
+    const match = headHtml.match(pattern);
+    if (match?.[1]) {
+      const v = match[1].toLowerCase();
+      if (v.includes('noindex') || /\bnone\b/.test(v)) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Stats returned from a scrape batch.
  */
 export interface ScrapeStats {
@@ -108,12 +133,15 @@ export interface ScrapeStats {
 }
 
 /**
- * Scrape a batch of URLs and return a map of URL → lastUpdated date.
+ * Scrape a batch of URLs and return a map of URL → lastUpdated date, plus a
+ * map of URL → whether the live page allows indexing (only for pages that were
+ * actually fetched OK — absent means "couldn't tell").
  */
 export async function scrapeContentDates(
   urls: string[]
-): Promise<{ dateMap: Map<string, string>; stats: ScrapeStats }> {
+): Promise<{ dateMap: Map<string, string>; indexableMap: Map<string, boolean>; stats: ScrapeStats }> {
   const dateMap = new Map<string, string>();
+  const indexableMap = new Map<string, boolean>();
   const stats: ScrapeStats = { scraped: 0, datesFound: 0, skipped: 0, errors: 0 };
 
   for (const url of urls) {
@@ -152,6 +180,8 @@ export async function scrapeContentDates(
 
       stats.scraped++;
 
+      indexableMap.set(url, !isNoindex(html, res.headers));
+
       const date = extractDate(html, res.headers);
       if (date) {
         dateMap.set(url, date);
@@ -163,5 +193,5 @@ export async function scrapeContentDates(
     await sleep(SCRAPE_DELAY_MS);
   }
 
-  return { dateMap, stats };
+  return { dateMap, indexableMap, stats };
 }

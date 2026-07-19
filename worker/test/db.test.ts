@@ -22,6 +22,7 @@ import {
   getPathTraffic,
   rebuildPageviewRollup,
   syncContentUpdatedDates,
+  syncNoindexMismatches,
 } from '../src/db';
 import { initDb, cleanDb, TEST_PROPERTY_ID } from './helpers';
 
@@ -595,6 +596,41 @@ describe('db — indexing submission backoff', () => {
       .first<{ content_updated_at: string; indexing_submit_count: number }>();
     expect(row!.content_updated_at).toBe('2026-07-10T00:00:00.000Z');
     expect(row!.indexing_submit_count).toBe(0);
+  });
+
+  it('syncNoindexMismatches flags stale noindex verdicts as changed, once per crawl generation', async () => {
+    const daysAgo = (d: number) => new Date(Date.now() - d * 86400000).toISOString();
+    // GSC says noindex (as of Google's crawl 30 days ago), but the live page
+    // is indexable — should be flagged as changed and become a candidate.
+    await env.DB
+      .prepare(`UPDATE urls SET coverage_state = 'Excluded by noindex tag', last_checked_at = ?, last_crawl_time = ?, indexing_submit_count = 2 WHERE url = ?`)
+      .bind(daysAgo(1), daysAgo(30), 'https://example.com/page1')
+      .run();
+
+    const flagged = await syncNoindexMismatches(env.DB, P, ['https://example.com/page1']);
+    expect(flagged).toBe(1);
+
+    const row = await env.DB
+      .prepare('SELECT content_updated_at, indexing_submit_count FROM urls WHERE url = ?')
+      .bind('https://example.com/page1')
+      .first<{ content_updated_at: string; indexing_submit_count: number }>();
+    expect(row!.content_updated_at! > daysAgo(30)).toBe(true);
+    expect(row!.indexing_submit_count).toBe(0);
+
+    const candidates = await getUrlsToSubmit(env.DB, P, 10);
+    expect(candidates.some((u) => u.url === 'https://example.com/page1' && u.type === 'URL_UPDATED')).toBe(true);
+
+    // Second pass in the same crawl generation → no re-bump
+    expect(await syncNoindexMismatches(env.DB, P, ['https://example.com/page1'])).toBe(0);
+  });
+
+  it('syncNoindexMismatches leaves non-noindex pages alone', async () => {
+    const daysAgo = (d: number) => new Date(Date.now() - d * 86400000).toISOString();
+    await env.DB
+      .prepare(`UPDATE urls SET coverage_state = 'Submitted and indexed', last_checked_at = ?, last_crawl_time = ? WHERE url = ?`)
+      .bind(daysAgo(1), daysAgo(30), 'https://example.com/page1')
+      .run();
+    expect(await syncNoindexMismatches(env.DB, P, ['https://example.com/page1'])).toBe(0);
   });
 
   it('upsertUrls only ever advances sitemap_lastmod', async () => {
