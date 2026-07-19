@@ -2,7 +2,7 @@
  * Integration tests for the Worker HTTP routes.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import worker, { pickPropertyToInspect, runIndexingSubmissions } from '../src/index';
 import { rebuildPageviewRollup } from '../src/db';
@@ -343,6 +343,59 @@ describe('Worker crawler guard', () => {
     );
     await waitOnExecutionContext(ctx);
     expect(response.status).toBe(200);
+  });
+});
+
+describe('Worker /sync manual sitemap crawl', () => {
+  const SITEMAP_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://www.test.com/</loc><lastmod>2026-07-10T00:00:00.000Z</lastmod></url>
+  <url><loc>https://www.test.com/new-page</loc></url>
+</urlset>`;
+
+  beforeEach(async () => {
+    await initDb(env.DB);
+    await cleanDb(env.DB);
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (input: string | Request) => {
+      const u = typeof input === 'string' ? input : input.url;
+      if (u.includes('sitemap')) return new Response(SITEMAP_XML, { status: 200 });
+      return new Response('Not found', { status: 404 });
+    }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('crawls the sitemap on demand and reports results', async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      new Request('https://gsc.test/sync?property=test-prop'),
+      env as any,
+      ctx
+    );
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
+    const data = (await response.json()) as Record<string, { urls_found?: number }>;
+    expect(data['test-prop'].urls_found).toBe(2);
+
+    const row = await env.DB
+      .prepare('SELECT sitemap_lastmod FROM urls WHERE url = ?')
+      .bind('https://www.test.com/')
+      .first<{ sitemap_lastmod: string | null }>();
+    expect(row!.sitemap_lastmod).toBe('2026-07-10T00:00:00.000Z');
+  });
+
+  it('returns 404 for an unknown property', async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      new Request('https://gsc.test/sync?property=nope'),
+      env as any,
+      ctx
+    );
+    await waitOnExecutionContext(ctx);
+    expect(response.status).toBe(404);
   });
 });
 

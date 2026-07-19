@@ -383,6 +383,30 @@ app.get('/trigger', async (c) => {
   return c.text('Check triggered. View results on the dashboard.');
 });
 
+// ---- Trigger a sitemap crawl manually ----
+// For when a site just deployed and you don't want to wait for the :00/:30
+// cron (e.g. new pages or fresh lastmod dates). Runs synchronously and
+// returns per-property results. /sync?property=<id> targets one property;
+// no param syncs all of them.
+app.get('/sync', async (c) => {
+  const url = new URL(c.req.url);
+  const db = c.env.DB;
+  const requested = url.searchParams.get('property');
+  const properties = await getProperties(db);
+  const targets = requested ? properties.filter((p) => p.id === requested) : properties;
+  if (requested && targets.length === 0) {
+    return c.json({ error: 'Property not found' }, 404);
+  }
+
+  const results: Record<string, Record<string, string | number>> = {};
+  for (const prop of targets) {
+    results[prop.id] = prop.sitemap_url
+      ? await syncPropertySitemap(db, prop)
+      : { error: 'no sitemap_url configured' };
+  }
+  return c.json(results);
+});
+
 // ---- Trigger only Indexing API submissions (for testing) ----
 app.get('/submit', async (c) => {
   const url = new URL(c.req.url);
@@ -645,31 +669,44 @@ app.get('/properties', async (c) => {
 // Cron handlers
 // ---------------------------------------------------------------------------
 
+/** Fetch a property's sitemap and reconcile the urls table against it.
+ * Records a 'sync' activity run either way; returns the recorded details
+ * (so the manual /sync route can report the outcome). Never throws. */
+async function syncPropertySitemap(db: D1Database, prop: Property): Promise<Record<string, string | number>> {
+  const syncStart = new Date().toISOString();
+  try {
+    const sitemapEntries = await getAllUrlsFromSitemap(prop.sitemap_url!);
+    if (sitemapEntries.length === 0) {
+      const details = { urls_found: 0, error: 'empty sitemap' };
+      await recordActivity(db, prop.id, 'sync', syncStart, new Date().toISOString(), details);
+      return details;
+    }
+    await upsertUrls(db, prop.id, sitemapEntries);
+
+    const reconciled = await reconcileUrls(db, prop.id, sitemapEntries.map((e) => e.url));
+    const details = {
+      urls_found: sitemapEntries.length,
+      marked_for_deletion: reconciled.markedForDeletion,
+      deleted: reconciled.deleted,
+      restored: reconciled.restored,
+    };
+    await recordActivity(db, prop.id, 'sync', syncStart, new Date().toISOString(), details);
+    return details;
+  } catch (error) {
+    const details = { error: String(error) };
+    await recordActivity(db, prop.id, 'sync', syncStart, new Date().toISOString(), details).catch(() => {});
+    return details;
+  }
+}
+
 async function handleSync(env: Env): Promise<void> {
   const db = env.DB;
   const properties = await getProperties(db);
 
   for (const prop of properties) {
     if (prop.sitemap_url) {
-      const syncStart = new Date().toISOString();
-      try {
-        const sitemapEntries = await getAllUrlsFromSitemap(prop.sitemap_url);
-        if (sitemapEntries.length === 0) {
-          await recordActivity(db, prop.id, 'sync', syncStart, new Date().toISOString(), { urls_found: 0, error: 'empty sitemap' });
-          continue;
-        }
-        await upsertUrls(db, prop.id, sitemapEntries);
-
-        const reconciled = await reconcileUrls(db, prop.id, sitemapEntries.map((e) => e.url));
-        await recordActivity(db, prop.id, 'sync', syncStart, new Date().toISOString(), {
-          urls_found: sitemapEntries.length,
-          marked_for_deletion: reconciled.markedForDeletion,
-          deleted: reconciled.deleted,
-          restored: reconciled.restored,
-        });
-      } catch (error) {
-        await recordActivity(db, prop.id, 'sync', syncStart, new Date().toISOString(), { error: String(error) }).catch(() => {});
-      }
+      const syncDetails = await syncPropertySitemap(db, prop);
+      if (syncDetails.error === 'empty sitemap') continue;
     }
 
     // Content date detection: scrape pages for meta tags / Last-Modified header
