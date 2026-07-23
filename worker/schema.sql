@@ -55,6 +55,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_property_type_started ON check_runs(property
 -- Direct range seek for the 2-hour error-streak query. The composite above only
 -- serves it via skip-scan, which the planner skips without ANALYZE stats.
 CREATE INDEX IF NOT EXISTS idx_runs_type_started ON check_runs(run_type, started_at);
+-- Serves the hourly 30-day retention DELETE (WHERE started_at < …).
+CREATE INDEX IF NOT EXISTS idx_runs_started ON check_runs(started_at);
 
 -- Analytics: user journey tracking
 CREATE TABLE IF NOT EXISTS sessions (
@@ -108,6 +110,9 @@ CREATE TABLE IF NOT EXISTS pageview_daily (
 -- Covering index for day-range scans across all paths (/api/traffic top query);
 -- the primary key serves the per-path lookups.
 CREATE INDEX IF NOT EXISTS idx_pageview_daily_property_day ON pageview_daily(property_id, day, page_path, sessions);
+-- Serves the hourly 30-day retention DELETE (WHERE day < …); day isn't a
+-- prefix of the primary key or the index above.
+CREATE INDEX IF NOT EXISTS idx_pageview_daily_day ON pageview_daily(day);
 
 CREATE TABLE IF NOT EXISTS http_events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
