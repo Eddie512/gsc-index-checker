@@ -9,6 +9,53 @@ function htmlPage(head: string): string {
   return `<!DOCTYPE html><html><head>${head}</head><body>hi</body></html>`;
 }
 
+describe('content-api — content date extraction', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('distrusts a fresh Last-Modified header but accepts an old one; meta always wins', async () => {
+    const freshHeader = new Date().toUTCString(); // ≈ render time — dynamic
+    const oldHeader = new Date(Date.now() - 10 * 86400000).toUTCString();
+
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/dynamic-header')) {
+        // famouspeople pattern: Last-Modified = now, no meta dates
+        return new Response(htmlPage('<title>t</title>'), {
+          status: 200,
+          headers: { 'Last-Modified': freshHeader },
+        });
+      }
+      if (url.includes('/honest-header')) {
+        return new Response(htmlPage('<title>t</title>'), {
+          status: 200,
+          headers: { 'Last-Modified': oldHeader },
+        });
+      }
+      if (url.includes('/meta-beats-header')) {
+        return new Response(
+          htmlPage('<meta property="article:modified_time" content="2026-07-01T00:00:00.000Z">'),
+          { status: 200, headers: { 'Last-Modified': freshHeader } }
+        );
+      }
+      return new Response('nope', { status: 404 });
+    }));
+
+    const { dateMap } = await scrapeContentDates([
+      'https://t.com/dynamic-header',
+      'https://t.com/honest-header',
+      'https://t.com/meta-beats-header',
+    ]);
+
+    // Render-timestamp header → no date at all (better none than a lie)
+    expect(dateMap.has('https://t.com/dynamic-header')).toBe(false);
+    // A header at least a day old is a real signal
+    expect(dateMap.get('https://t.com/honest-header')).toBe(new Date(oldHeader).toISOString());
+    // Editorial meta date wins over any header
+    expect(dateMap.get('https://t.com/meta-beats-header')).toBe('2026-07-01T00:00:00.000Z');
+  });
+});
+
 describe('content-api — noindex detection', () => {
   afterEach(() => {
     vi.restoreAllMocks();
