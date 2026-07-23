@@ -9,6 +9,7 @@ export default defineWorkersConfig({
           d1Databases: {
             DB: 'test-gsc-index-checker',
           },
+          kvNamespaces: ['TRAFFIC_CACHE'],
         },
       },
     },

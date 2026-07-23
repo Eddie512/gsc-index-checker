@@ -288,26 +288,28 @@ app.get('/api/traffic', async (c) => {
   const limitRaw = parseInt(c.req.query('limit') || '50', 10);
   const limit = Math.min(200, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 50));
 
-  // getPathTraffic is expensive and this endpoint is hit on every render of the
-  // public trending widget, so cache the result at the edge keyed by the
-  // normalized params. Note caches.default is per-datacenter, not global — every
-  // colo warms its own copy — so the TTL is generous (1h; trending over a
-  // multi-day window barely moves in an hour). CORS is applied by middleware on
-  // both hit and miss, so the stored copy doesn't need the header.
-  const cache = caches.default;
-  const cacheKey = new Request(
-    `https://traffic-cache.internal/?property=${encodeURIComponent(propertyId)}&days=${days}&limit=${limit}`
-  );
-  const cached = await cache.match(cacheKey);
-  if (cached) return new Response(cached.body, cached);
+  // getPathTraffic is expensive and this endpoint is hit on every render of
+  // the public trending widget, so cache the JSON in KV keyed by the
+  // normalized params. KV is global — the previous caches.default was
+  // per-datacenter, so every colo paid its own miss (~667 D1 recomputes/day
+  // across the world); KV brings that to ~one per key per TTL. Trending over a
+  // multi-day window barely moves in an hour, hence the 1h TTL. CORS is
+  // applied by middleware on both hit and miss.
+  const cacheKey = `traffic:${propertyId}:${days}:${limit}`;
+  const cached = await c.env.TRAFFIC_CACHE.get(cacheKey, 'json');
+  if (cached !== null) {
+    const res = c.json(cached);
+    res.headers.set('Cache-Control', 'public, max-age=3600');
+    return res;
+  }
 
   const property = await getProperty(c.env.DB, propertyId);
   if (!property) return c.json({ error: 'Property not found' }, 404);
 
   const traffic = await getPathTraffic(c.env.DB, propertyId, days, limit);
+  await c.env.TRAFFIC_CACHE.put(cacheKey, JSON.stringify(traffic), { expirationTtl: 3600 });
   const res = c.json(traffic);
   res.headers.set('Cache-Control', 'public, max-age=3600');
-  c.executionCtx.waitUntil(cache.put(cacheKey, res.clone()));
   return res;
 });
 
