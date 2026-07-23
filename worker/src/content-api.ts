@@ -66,20 +66,21 @@ function parseDate(raw: string): string | null {
 
 /**
  * Extract last-modified date from a page's HTML and HTTP headers.
+ *
+ * Meta/JSON-LD dates are editorial claims and take priority. The HTTP
+ * Last-Modified header comes last and is only trusted when it's at least a
+ * day old: some frameworks emit Last-Modified ≈ render time, which made every
+ * daily scrape look like a fresh content change (famouspeople re-queued ~120
+ * unchanged pages for submission weekly, burning ~a third of the daily
+ * quota). A genuinely-just-updated header-only page is picked up one scrape
+ * cycle later, once its header stops looking like a render timestamp.
  */
 function extractDate(html: string, headers: Headers): string | null {
-  // 1. HTTP Last-Modified header
-  const lastMod = headers.get('last-modified');
-  if (lastMod) {
-    const d = parseDate(lastMod);
-    if (d) return d;
-  }
-
   // Only scan the <head> portion for meta tags
   const headEnd = html.indexOf('</head>');
   const headHtml = headEnd > 0 ? html.slice(0, headEnd + 7) : html.slice(0, 15000);
 
-  // 2. Meta tags
+  // 1. Meta tags
   for (const pattern of META_PATTERNS) {
     const match = headHtml.match(pattern);
     if (match?.[1]) {
@@ -88,7 +89,7 @@ function extractDate(html: string, headers: Headers): string | null {
     }
   }
 
-  // 3. JSON-LD in <script type="application/ld+json"> blocks
+  // 2. JSON-LD in <script type="application/ld+json"> blocks
   const ldMatches = html.matchAll(/<script[^>]+type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
   for (const m of ldMatches) {
     const jsonBlock = m[1];
@@ -96,6 +97,16 @@ function extractDate(html: string, headers: Headers): string | null {
     if (dateMatch?.[1]) {
       const d = parseDate(dateMatch[1]);
       if (d) return d;
+    }
+  }
+
+  // 3. HTTP Last-Modified header — only if it isn't suspiciously fresh
+  const lastMod = headers.get('last-modified');
+  if (lastMod) {
+    const d = parseDate(lastMod);
+    if (d) {
+      const age = Date.now() - Date.parse(d);
+      if (Number.isFinite(age) && age > 24 * 60 * 60 * 1000) return d;
     }
   }
 
