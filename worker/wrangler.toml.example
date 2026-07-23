@@ -7,6 +7,11 @@ binding = "DB"
 database_name = "gsc-index-checker"
 database_id = "" # Run `npx wrangler d1 create gsc-index-checker` and paste the ID here
 
+# Global response cache for /api/traffic
+[[kv_namespaces]]
+binding = "TRAFFIC_CACHE"
+id = "559bb25875e64ebca21bafdb1493ce21"
+
 # Cron triggers (Cloudflare max = 3)
 # :00/:30       = sitemap sync (all properties)
 # every 7 min   = inspect one property (round-robin by invocation count)
